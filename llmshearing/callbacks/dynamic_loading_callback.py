@@ -27,7 +27,9 @@ class DynamicLoadingCallback(Callback):
         self.proportion = proportion
         self.count = -1
         self.used_domain_ids = [[] for _ in range(self.n_domains)]
-        print("Target loss:", self.target_loss)
+
+    def init(self, state: State, logger: Logger):
+        logger.log_traces({"Target loss": self.target_loss})
             
     def update_proportion(self, current_prop, losses):
         """ Update the proportion of each domain """

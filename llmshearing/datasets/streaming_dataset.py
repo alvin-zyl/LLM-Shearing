@@ -6,6 +6,7 @@
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
+import os
 from threading import Event
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -195,7 +196,11 @@ class DynamicStreamingDataset(StreamingDataset):
         # Load the correct resumption meta data.
         epoch = obj['epoch']
         assert epoch == 0, "Currently only supports dynamic loading from each domain for once."
-        used_sample_ids = obj['used_sample_ids']
+        
+        # Deliberately avoid resuming loading inside dataset for true reproducibility
+        used_sample_ids = [[] for _ in obj['used_sample_ids']]
+        # used_sample_ids = obj['used_sample_ids']
+
         self.num_canonical_nodes = obj['num_canonical_nodes']
         self.shuffle_seed = obj['shuffle_seed']
         self._set_predownload()
@@ -221,6 +226,11 @@ class DynamicStreamingDataset(StreamingDataset):
         epoch, used_sample_ids = self._resume(world, presumed_epoch)
 
         # Wait for everyone to get the epoch above.
+
+        print(
+            f"Process {os.getpid()} sees barrier at address {id(self._shared_barrier)}, num_enter = {self._shared_barrier.num_enter} "\
+            f"_arr at address {id(self._shared_barrier._arr)}, _arr.name: {self._shared_barrier._arr.name}"
+            )
         self._shared_barrier(world.workers_per_node)
 
         # Set the new next epoch.

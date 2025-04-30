@@ -2,6 +2,7 @@ import contextlib
 from copy import deepcopy
 import datetime
 import itertools
+import re
 from typing import (
     Any,
     Dict,
@@ -38,6 +39,7 @@ from composer.core import (
     Event,
     Evaluator,
     Timestamp,
+    Time,
 )
 from composer.trainer.dist_strategy import prepare_ddp_module, prepare_fsdp_module
 from composer.trainer._scaler import ClosureGradScaler
@@ -141,6 +143,55 @@ def is_auto_microbatching(
         return True
     else:
         return False
+
+
+def filter_metrics(
+    metrics: Dict[str, Metric], metric_names: Optional[List[str]]
+) -> Dict[str, Metric]:
+    """
+    Filter the metrics based on the given metric_names as regex strings (e.g. 'Accuracy', 'f1' for 'BinaryF1Score',
+    'Top-.' for 'Top-1 Accuracy' and 'Top-2 Accuracy', etc).
+    If no metric_names are provided, all metrics will be returned.
+    """
+    metrics = deepcopy(metrics)
+    if not metric_names:
+        return metrics
+    else:
+        filtered_metrics = {}
+        for name, metric in metrics.items():
+            if any(
+                re.match(f".*{metric_name}.*", name, re.IGNORECASE)
+                for metric_name in metric_names
+            ):
+                filtered_metrics[name] = metric
+        return filtered_metrics
+
+
+def set_evaluator_interval_and_subset_num_batches(
+    evaluators: Sequence[Evaluator],
+    eval_interval: Union[int, str, Time, Callable[[State, Event], bool]],
+    subset_num_batches: int,
+):
+    # convert eval_dataloader to `List[Evaluator]`
+    for evaluator in evaluators:
+        if evaluator.subset_num_batches is None:
+            evaluator.subset_num_batches = subset_num_batches
+        if evaluator.eval_interval is None:
+            evaluator.eval_interval = eval_interval
+        eval_dataloader = evaluator.dataloader.dataloader
+        if isinstance(eval_dataloader, collections.abc.Sized) and (
+            evaluator.subset_num_batches is None or evaluator.subset_num_batches == -1
+        ):
+            try:
+                dataloader_len = len(eval_dataloader)
+            except TypeError:
+                dataloader_len = None
+            if dataloader_len == None:
+                raise ValueError(
+                    "eval_subset_num_batches must be set when using an infinite sized "
+                    "eval_dataloader where length is `None`. Otherwise, evaluation will "
+                    "run forever and never terminate."
+                )
 
 
 def validate_precision(precision: Precision, device: Device):
@@ -331,8 +382,12 @@ def iter_dataloader(state: State, engine: "CallbackEngine", logger: Logger):
         dataloader_iter = itertools.islice(state.dataloader, int(state.dataloader_len))
 
     while True:
-        engine.before_dataloader(state, logger)
-        batch = next(dataloader_iter)
+        try:
+            engine.before_dataloader(state, logger)
+            batch = next(dataloader_iter)
+        except StopIteration:
+            break
+        
         yield batch
 
 
@@ -376,10 +431,12 @@ def spin_dataloaders_to_cur_epoch(state: State):
     """
     # spin the evaluator dataloaders once to initialize its sampler deterministically
     # so it does not affect any other RNG reads
-    eval_state = state.dataset_resumption.get('eval', {})
+    eval_state = state.dataset_resumption.get("eval", {})
     for evaluator in state.evaluators:
         dataloader = evaluator.dataloader.dataloader
-        if isinstance(dataloader, DataLoader) and isinstance(dataloader.sampler, DistributedSampler):
+        if isinstance(dataloader, DataLoader) and isinstance(
+            dataloader.sampler, DistributedSampler
+        ):
             dataloader.sampler.set_epoch(0)
         if evaluator.label not in eval_state:
             for _ in dataloader:
@@ -387,10 +444,12 @@ def spin_dataloaders_to_cur_epoch(state: State):
 
     # spin the train dataloader's sampler to get to the state of the desired epoch
     dataloader = state.dataloader
-    assert dataloader is not None, 'train dataloader is set on state after FIT_START'
-    if 'train' not in state.dataset_resumption:
+    assert dataloader is not None, "train dataloader is set on state after FIT_START"
+    if "train" not in state.dataset_resumption:
         for epoch in range(int(state.timestamp.epoch)):
-            if isinstance(dataloader, DataLoader) and isinstance(dataloader.sampler, DistributedSampler):
+            if isinstance(dataloader, DataLoader) and isinstance(
+                dataloader.sampler, DistributedSampler
+            ):
                 dataloader.sampler.set_epoch(epoch)
             for _ in dataloader:
                 break
@@ -641,21 +700,21 @@ def train_batch(
                         **kwargs,
                     ).item()
                 )
-        else:
-            train_microbatches(
-                state,
-                engine,
-                logger,
-                use_grad_scaling,
-                microbatches,
-                total_loss_dict,
-            )
-            if not state.deepspeed_enabled:
-                for optimizer in state.optimizers:
-                    if use_grad_scaling:
-                        state.scaler.step(optimizer)
-                    else:
-                        optimizer.step()
+    else:
+        train_microbatches(
+            state,
+            engine,
+            logger,
+            use_grad_scaling,
+            microbatches,
+            total_loss_dict,
+        )
+        if not state.deepspeed_enabled:
+            for optimizer in state.optimizers:
+                if use_grad_scaling:
+                    state.scaler.step(optimizer)
+                else:
+                    optimizer.step()
 
     if state.auto_microbatching:
         raise ValueError(f"auto_microbatching not supported yet")
@@ -935,8 +994,6 @@ def compute_and_log_metrics(
 
 
 def run_evaluators(state: State, event: Event, engine: CallbackEngine, logger: Logger):
-    logger.log_traces({"Eval":"Skipping eval"})
-    return
     """Runs evaluators periodically during training."""
     evaluators_executing = []
     for evaluator in state.evaluators:
@@ -950,7 +1007,7 @@ def run_evaluators(state: State, event: Event, engine: CallbackEngine, logger: L
     if not any(evaluators_executing):
         return
 
-    engine.eval_before_all()
+    engine.eval_before_all(state, logger)
     for index, evaluator in enumerate(state.evaluators):
         if evaluators_executing[index]:
             _eval_loop(
@@ -959,10 +1016,10 @@ def run_evaluators(state: State, event: Event, engine: CallbackEngine, logger: L
                 evaluator=evaluator,
                 subset_num_batches=evaluator.subset_num_batches,
                 metrics=state.eval_metrics[evaluator.label],
-                logger=logger
+                logger=logger,
             )
 
-    engine.eval_after_all()
+    engine.eval_after_all(state, logger)
 
 
 def _eval_loop(
@@ -1001,7 +1058,7 @@ def _eval_loop(
         state.set_dataloader(data_spec.dataloader, evaluator.label, subset_num_batches)
         assert state.dataloader is not None, "dataloader is set"
 
-        engine.eval_start()
+        engine.eval_start(state, logger)
 
         metrics = ensure_metrics_device_and_dtype(state, metrics)
 
@@ -1037,7 +1094,7 @@ def _eval_loop(
                         "DistributedSampler to correctly drop duplicate samples."
                     )
 
-        for state.batch in iter_dataloader(state):
+        for state.batch in iter_dataloader(state, engine, logger):
             state.batch = state.device.batch_to_device(state.batch)
             if data_spec.device_transforms is not None:
                 state.batch = data_spec.device_transforms(state.batch)
@@ -1064,7 +1121,7 @@ def _eval_loop(
             if state.deepspeed_enabled:
                 raise ValueError(f"Deepspeed not supported")
 
-            engine.eval_batch_start()
+            engine.eval_batch_start(state, logger)
 
             # Cache the device batch, because `self.state.batch` gets overridden in microbatching loop
             device_batch = state.batch
@@ -1085,13 +1142,10 @@ def _eval_loop(
                     and last_microbatch
                 ):
                     padding = dist_sampler.total_size - dataset_len
-                    if (
-                        dist.get_global_rank()
-                        >= dist.get_world_size() - padding
-                    ):
+                    if dist.get_global_rank() >= dist.get_world_size() - padding:
                         rank_num_samples -= 1
-                        num_samples_in_microbatch = (
-                            data_spec.get_num_samples_in_batch(state.batch)
+                        num_samples_in_microbatch = data_spec.get_num_samples_in_batch(
+                            state.batch
                         )
                         # Skip updating metric if batch is only padded samples
                         if num_samples_in_microbatch == 1:
@@ -1102,18 +1156,16 @@ def _eval_loop(
                                 state.batch, num_samples_in_microbatch - 1
                             )[0]
 
-                engine.eval_before_forward()
+                engine.eval_before_forward(state, logger)
 
                 with _get_precision_context(
                     state.precision,
                     state.precision_config,
                     state.deepspeed_enabled,
                 ):
-                    state.outputs = state._original_model.eval_forward(
-                        state.batch
-                    )
+                    state.outputs = state._original_model.eval_forward(state.batch)
 
-                engine.eval_after_forward()
+                engine.eval_after_forward(state, logger)
 
                 # Skip metric update if batch is only padded samples. We do this after
                 # forward as all models must run forward for FSDP.
@@ -1160,11 +1212,13 @@ def _eval_loop(
 
             last_wct = now
 
-            engine.eval_batch_end()
+            engine.eval_batch_end(state, logger)
 
-        compute_and_log_metrics(state, dataloader_label=evaluator.label, metrics=metrics, logger=logger)
+        compute_and_log_metrics(
+            state, dataloader_label=evaluator.label, metrics=metrics, logger=logger
+        )
 
-        engine.eval_end()
+        engine.eval_end(state, logger)
 
     state.set_dataloader(original_dataloader, original_dataloader_label)
     if original_num_batches is not None:

@@ -166,7 +166,6 @@ class ComposerMosaicLlama(ComposerModel):
 class LlamaModel(nn.Module):
     def __init__(self, cfg: DictConfig):
         super().__init__()
-        print(f'Tried to build Llama model with cfg.name={cfg.name}')
         self.cfg = cfg
         
         ### added ###
