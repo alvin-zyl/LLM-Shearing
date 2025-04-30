@@ -1,18 +1,5 @@
-#!/bin/bash
-#SBATCH --job-name=test
-#SBATCH --partition=gputest
-#SBATCH --time=1:00:00
-
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=512gb
-#SBATCH --constraint gpu80
-#SBATCH --output=/scratch/gpfs/mengzhou/space2/out/logs/%x-%j.out
-
-PROJ_DIR=$n/space2/LLM-Shearing
-LOG_DIR=/scratch/gpfs/mengzhou/space2/out/logs
+#!/bin/sh
+PROJ_DIR=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing
 
 # num_nodes=$(scontrol show job $SLURM_JOB_ID | grep NodeList=della | wc -l)
 num_nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST | wc -l)
@@ -29,6 +16,10 @@ echo "MASTER_PORT="$MASTER_PORT
 echo "WORLD_SIZE="$WORLD_SIZE
 echo "num_nodes="$num_nodes
 
-if [[ $num_nodes == 1 ]]; then composer $PROJ_DIR/llmshearing/train.py $@; 
-else srun --output=$LOG_DIR/%x-%j-%n.out bash $PROJ_DIR/llmshearing/scripts/srun_launch.sh $@; fi
+export HF_HOME="/pscratch/sd/a/alvinliu/datasets/.cache/huggingface"
+
+if [[ $num_nodes == 1 ]]; then shifter composer $PROJ_DIR/llmshearing/train.py $@; 
+else srun shifter bash $PROJ_DIR/llmshearing/scripts/srun_launch.sh $@; fi
+# else srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=$SLURM_JOB_NUM_NODES \
+#     --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT $PROJ_DIR/llmshearing/train.py $@; fi
  

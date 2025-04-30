@@ -1,21 +1,25 @@
-# pruning llama2 7b -> 3b or 1.3b
+#!/bin/sh
+#SBATCH -A m4788_g
+#SBATCH -q premium
+#SBATCH -C gpu&hbm40g
+#SBATCH -t 1:00:00
+#SBATCH --image=alvinliu12138/zhanggroup:shearllm
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=1
 
-# Please specify the working folder
-PROJ_DIR=/scratch/gpfs/mengzhou/space2/LLM-Shearing
-LAUNCH_SCRIPT=${PROJ_DIR}/llmshearing/scripts/launch.sh
-DATA_DIR=/scratch/gpfs/mengzhou/llm_data/version5-uint16/500b_dedup_4k/for_prune
-OUTPUT_DIR=/scratch/gpfs/mengzhou/space2/out/test_release_pruning_full
+PROJ_DIR=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing
+LAUNCH_SCRIPT=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/scripts/launch.sh
+DATA_DIR=/pscratch/sd/a/alvinliu/datasets/shearllm/for_prune
+OUTPUT_DIR=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
 TRAIN_SCRIPT=${PROJ_DIR}/llmshearing/train.py
-MODEL_PATH=/projects/DANQIC/mengzhou/LLaMA2
+MODEL_PATH=${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer
 
 # Specify $PROJ_DIR in scripts/launch.sh and scripts/srun_launch.sh if using slurm
-
-test=False
 
 from_model=7b # source model size
 to_model=2.7b # target model size
 config_file=${PROJ_DIR}/llmshearing/configs/llama2/${from_model}.yaml
-path=$MODEL_PATH/mosaic-7B/state_dict.pt
+path=$MODEL_PATH/state_dict.pt
 
 # data setup
 data_local=${DATA_DIR}
@@ -29,7 +33,7 @@ device_eval_batch_size=8
 # learning setup
 lr=1e-4 # learning rate for the main parameters
 max_duration=3200ba # 0.42B tokens
-save_interval=3200ba # save in the end
+save_interval=500ba # save in the end
 t_warmup=320ba # 10% learning rate warmup 
 
 # dynamic loading setup
@@ -63,23 +67,30 @@ elif [[ $to_model == 370m ]]; then
 fi
 
 # save directroy
+TAG=${TAG:-"none"}
 run_name=llama2_${from_model}_pruning_scaling_${update_type}_to${to_model}_sl${max_seq_len}
+if [ "${TAG}" != "none" ]; then
+    run_name=${TAG}_${run_name}
+fi
 save_dir=${OUTPUT_DIR}/${run_name}
 wandb_dir=${save_dir} # save locally
 
-if [[ $test == True ]]; then t=00-01:00:00; else t=00-20:00:00; fi
+num_nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST | wc -l)
+master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
-# Run in bash, it will automatically use resources available in the current environment
-# composer $TRAIN_SCRIPT \
+export MASTER_ADDR=$master_addr
+export WORLD_SIZE=$(( $num_nodes * $SLURM_GPUS_PER_NODE ))
+export MASTER_PORT=$(( 10000 + RANDOM % 10000 ))
 
-# Run with slurm    
-sbatch --job-name ${run_name} \
-    --nodes=4 \
-    --gpus-per-node=2 \
-    --mem=512gb \
-    --cpus-per-task=8 \
-    --time $t \
-    $LAUNCH_SCRIPT \
+echo "MASTER_ADDR="$MASTER_ADDR
+echo "MASTER_PORT="$MASTER_PORT
+echo "WORLD_SIZE="$WORLD_SIZE
+echo "num_nodes="$num_nodes
+
+export HF_HOME="/pscratch/sd/a/alvinliu/datasets/.cache/huggingface"
+
+srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=$SLURM_JOB_NUM_NODES \
+    --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT $PROJ_DIR/llmshearing/train_torch.py \
     $config_file \
     run_name=${run_name} \
     data_local=${data_local} \
