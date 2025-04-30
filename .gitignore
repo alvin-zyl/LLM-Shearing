@@ -1,0 +1,10 @@
+wandb
+*.out
+*/__pycache__
+*/*/__pycache__
+*/*/*/__pycache__
+*.code-workspace
+.hypothesis
+.vscode
+llmshearing/models/*/*.pt
+*.ipynb
