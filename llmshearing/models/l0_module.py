@@ -431,8 +431,8 @@ class L0Module(nn.Module):
         head_layer_score, head_score = self.transform_scores_for_head(expected_scores)
         mlp_score, int_score = self.transform_scores_for_mlp(expected_scores)
         
-        head_score = (head_layer_score * head_score) # 12 * 12
-        int_score = (mlp_score * int_score) # 12 * 3072
+        head_score = (head_layer_score * head_score) if head_layer_score is not None else head_score # 12 * 12
+        int_score = (mlp_score * int_score) if mlp_score is not None else int_score # 12 * 3072
 
         qk_score = None
         if "qk_head_dim" in expected_scores:

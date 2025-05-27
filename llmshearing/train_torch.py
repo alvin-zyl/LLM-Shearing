@@ -79,13 +79,10 @@ from llmshearing.datasets.load_text_dataloader import build_text_dataloader
 from llmshearing.models.model_registry import COMPOSER_MODEL_REGISTRY
 from state import State
 
-import streaming
-streaming.base.util.clean_stale_shared_memory()
-
-
 def console_print(msg):
     if not dist.get_rank():
         print(msg)
+
 
 def validate_config(cfg: DictConfig):
     """Validates compatible model and dataloader selection."""
@@ -274,8 +271,6 @@ def main(cfg):
         getattr(cfg.callbacks.data_loading, "set_names", None) is not None
     ), "please specify the set (domain) names in the config"
 
-    # Dataloaders
-    # if global_rank == 0:
     console_print("Building train loader...")
     train_loader = build_text_dataloader(
         cfg.train_loader,
@@ -360,15 +355,18 @@ def main(cfg):
     if data_loading_config.dynamic:
         # reload the function that allows saving the used domain ids
         from llmshearing.datasets.state import _dataset_state_dict
+
         state._dataset_state_dict = MethodType(_dataset_state_dict, state)
-    
+
     engine = CallbackEngine()
 
     state.callbacks[:] = list(cast(List[Callback], loggers)) + state.callbacks
 
     loggers = Logger(state=state, destinations=loggers)
     console_print("Logging config...")
-    log_config(cfg)
+
+    if not dist.get_rank():
+        log_config(cfg)
 
     checkpoint_saver = None
     latest_remote_file_name = None
@@ -486,6 +484,7 @@ def main(cfg):
         prepare_fsdp_module(
             model, optimizers, state.fsdp_config, precision, device, auto_microbatching
         )
+        loggers.log_traces({"INFO": "FSDP prepared"})
 
     engine.after_load(state, loggers)
     reproducibility.seed_all(state.seed)
@@ -503,9 +502,7 @@ def main(cfg):
             path=parsed_load_path,
         )
         state.run_name = cfg.run_name
-        # reproducibility.seed_all(seed)
-        # reproducibility.load_rng_state(rng_state)
-        # rng_state = None
+        loggers.log_traces({"Finished": f"Loading from {load_path}"})
 
     if (
         not state.fsdp_enabled
@@ -516,6 +513,7 @@ def main(cfg):
         prepare_fsdp_module(
             model, optimizers, state.fsdp_config, precision, device, auto_microbatching
         )
+        loggers.log_traces({"INFO": "FSDP prepared"})
 
     engine.fit_start(state, loggers)
     use_grad_scaling = use_grad_scaling_(state, state.precision, state.scaler)
@@ -543,11 +541,12 @@ def main(cfg):
 
         loggers.log_metrics({"time/epoch": state.timestamp.epoch.value})
 
+        print(
+            f"Process {os.getpid()} starting loading data in epoch {int(state.timestamp.epoch)}"
+        )
         for batch_idx, state.batch in enumerate(
             iter_dataloader(state, engine, loggers)
         ):
-            # if 'train' not in state.dataset_resumption and batch_idx < int(
-            #     state.timestamp.batch_in_epoch):
             if batch_idx < int(state.timestamp.batch_in_epoch):
                 # Restore the RNG state immediately before the next batch is yielded from the dataloader
                 if (

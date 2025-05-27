@@ -145,7 +145,8 @@ class DynamicStreamingDataset(StreamingDataset):
         """
         world = World()
         epoch = self.next_epoch - 1
-        epoch, offset = self._resume(world, epoch)
+        epoch = 0
+        # epoch, offset = self._resume(world, epoch)
 
         assert from_beginning
         domain_sample_in_epoch = [len(used_sample_ids[i]) for i in range(len(self.set_names))] 
@@ -388,7 +389,8 @@ class DynamicStreamingDataset(StreamingDataset):
         # Discover where we left off, if there is a checkpoint, or start at the next epoch.
         # Also pre-increment the epoch counter.
         world = World()
-        epoch, used_sample_ids = self._resume_incr_epoch(world)
+        # epoch, used_sample_ids = self._resume_incr_epoch(world)
+        epoch, used_sample_ids = 0, np.array([[] for _ in range(self.num_streams)], dtype=np.int64)
 
         # Get this worker's partition of samples to process.
         sample_ids_per_stream = self._get_work(world, epoch, used_sample_ids)

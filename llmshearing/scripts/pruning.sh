@@ -26,7 +26,7 @@ data_local=${DATA_DIR}
 
 # basic setup
 max_seq_len=4096
-device_train_microbatch_size=4
+device_train_microbatch_size=2
 global_train_batch_size=32
 device_eval_batch_size=8
 
@@ -75,6 +75,13 @@ fi
 save_dir=${OUTPUT_DIR}/${run_name}
 wandb_dir=${save_dir} # save locally
 
+CONTINUE=${CONTINUE:-"none"}
+if [ "${CONTINUE}" != "none" ]; then
+    readonly load_flag="load_path=${CONTINUE} save_overwrite=true"
+else
+    readonly load_flag=""
+fi
+
 num_nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST | wc -l)
 master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
@@ -110,7 +117,7 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     optimizer.lag_lr=${lag_lr} \
     model.path=${path} \
     model.l0_module.lagrangian_warmup_steps=${lagr_warmup} \
-    model.l0_module.pruning_modules='[head,intermediate,layer,hidden]' \
+    model.l0_module.pruning_modules='[head,intermediate,hidden]' \
     model.l0_module.eval_target_model=${eval_target_model} \
     model.l0_module.target_model.d_model=${target_d_model} \
     model.l0_module.target_model.n_heads=${target_n_heads} \
@@ -124,4 +131,4 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     train_loader.num_workers=0 \
     train_loader.prefetch_factor=null \
     train_loader.persistent_workers=false \
-    autoresume=false
+    $load_flag

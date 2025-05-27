@@ -23,7 +23,6 @@ from torch._C._distributed_c10d import ReduceOp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, DistributedSampler
-from loguru import logger
 import math, torch
 import collections.abc
 from omegaconf import DictConfig
@@ -71,7 +70,7 @@ def calculate_batch_size_info(
         device_grad_accum = "auto"
     elif isinstance(device_microbatch_size, int):
         if device_microbatch_size > device_batch_size:
-            logger.warning(
+            warnings.warn(
                 f"device_microbatch_size > device_batch_size, "
                 + f"will be reduced from {device_microbatch_size} -> {device_batch_size}."
             )
@@ -126,7 +125,7 @@ def is_auto_microbatching(
     device_train_microbatch_size: Optional[Union[int, str]], device: Device
 ):
     if device_train_microbatch_size == "auto":
-        logger.warning(
+        warnings.warn(
             (
                 "`device_train_microbatch_size='auto'` may potentially fail with unexpected "
                 "CUDA errors. Auto microbatching attempts to catch CUDA Out of Memory errors "

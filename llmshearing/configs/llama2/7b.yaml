@@ -9,7 +9,7 @@ run_name: # If left blank, will be read from env var $COMPOSER_RUN_NAME
 
 model:
   name: mosaic_llama2_7b 
-  path: /projects/DANQIC/mengzhou/LLaMA2/mosaic-7B/state_dict.pt
+  path: /global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/models/Llama-2-7b-composer/state_dict.pt
   init_device: "cpu" 
   tokenizer_name: ${tokenizer_name}
   d_model: 4096
@@ -27,7 +27,7 @@ model:
   l0_module:
     start_sparsity: 0.0
     target_sparsity: 0.5
-    pruning_modules: ["head", "head_layer", "mlp", "intermediate"]
+    pruning_modules: ["head", "layer", "hidden", "intermediate"]
     lagrangian_warmup_steps: 320ba 
     target_model:
       d_model: 2560
@@ -111,6 +111,9 @@ fsdp_config:
   activation_checkpointing: true
   activation_cpu_offload: false
   verbose: false
+  state_dict_type: sharded
+  use_orig_params: true
+  limit_all_gathers: true
 
 # Logging
 progress_bar: false
