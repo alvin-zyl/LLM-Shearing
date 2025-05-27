@@ -3,6 +3,7 @@
 
 from llmshearing.models.composer_llama import ComposerMosaicLlama
 from llmshearing.models.composer_pythia import ComposerMosaicPythia
+from llmshearing.models.composer_cola import ComposerMosaicCoLA
 
 COMPOSER_MODEL_REGISTRY = {
     'mosaic_llama_125m': ComposerMosaicLlama,
@@ -22,5 +23,6 @@ COMPOSER_MODEL_REGISTRY = {
     "mosaic_llama2_3b": ComposerMosaicLlama,
     'mosaic_llama2_7b': ComposerMosaicLlama,
     'mosaic_llama2_13b': ComposerMosaicLlama,
-    'mosaic_together_3b': ComposerMosaicPythia 
+    'mosaic_together_3b': ComposerMosaicPythia,
+    'mosaic_cola_7b': ComposerMosaicCoLA
 }

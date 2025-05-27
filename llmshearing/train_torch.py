@@ -119,7 +119,7 @@ def load_state_dict(model: nn.Module, state_dict: Dict[str, Any]):
 
 
 def build_optimizer(
-    model: torch.nn.Module, name: str, optimizer_config: Dict[str, Any]
+    model: torch.nn.Module, name: str, optimizer_config: Dict[str, Any], cola_params_only=False
 ) -> Optimizer:
     """
     build optimizer that consists of three groups of parameters:
@@ -128,6 +128,10 @@ def build_optimizer(
     - lagrange_params: parameters of the lagrange multipliers
     """
     param_groups = {}
+    cola_model_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+    aux_model_params = [
+        p for n, p in model.named_parameters() if "ln" in n or "wte" in n
+    ]
     main_model_params = [p for n, p in model.named_parameters() if "l0_module" not in n]
     l0_module_params = [
         p for n, p in model.named_parameters() if "l0_module" in n and "lambda" not in n
@@ -136,7 +140,27 @@ def build_optimizer(
         p for n, p in model.named_parameters() if "l0_module" in n and "lambda" in n
     ]
 
-    param_groups = [{"params": main_model_params, "lr": optimizer_config.lr}]
+    if cola_model_params and cola_params_only:
+        aux_model_params_names = [
+            n for n, p in model.named_parameters() if "ln" in n or "wte" in n
+        ]
+        main_model_params_names = [
+            n for n, p in model.named_parameters() if "l0_module" not in n
+        ]
+        for n, p in model.named_parameters():
+            if n in main_model_params_names and n not in aux_model_params_names and "cola_b" not in n:
+                p.requires_grad_(False)
+
+    param_groups = [
+        {
+            "params": (
+                main_model_params
+                if (not cola_model_params or not cola_params_only)
+                else cola_model_params + aux_model_params
+            ),
+            "lr": optimizer_config.lr,
+        }
+    ]
     lag_lr = pop_config(optimizer_config, "lag_lr")
     if len(l0_module_params) > 0:
         param_groups.extend(
