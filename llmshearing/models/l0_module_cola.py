@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
+from omegaconf import OmegaConf as om
 
 from argparse import Namespace as NS
 from typing import Any, List
@@ -144,14 +145,11 @@ class L0Module(nn.Module):
 
         # base and target model info
         n_matrix_mlp = 2 if "pythia" in cfg.name else 3
-        self.base_model_info = self.set_model_info(cfg, n_matrix_mlp=n_matrix_mlp)
         l0_module_cfg = cfg.l0_module
-        self.target_model_info = None
         target_model_cfg = getattr(l0_module_cfg, "target_model", None)
         if target_model_cfg is not None:
-            self.target_model_info = self.set_model_info(
-                target_model_cfg, n_matrix_mlp=n_matrix_mlp
-            )
+            merged_model_cfg = om.merge(cfg, target_model_cfg)
+        self.model_info = self.set_model_info(merged_model_cfg, n_matrix_mlp=n_matrix_mlp)
 
         # l0 config
         self.pruning_modules = l0_module_cfg.pruning_modules
@@ -177,10 +175,10 @@ class L0Module(nn.Module):
         self.lambdas = torch.nn.ParameterDict(self.lambdas)
 
         # config after initialization
-        self.prunable_model_size = self.base_model_info.full_model_size
+        self.prunable_model_size = self.model_info.full_model_size
 
         if target_model_cfg is not None:
-            self.prunable_target_model_size = self.target_model_info.full_model_size
+            self.prunable_target_model_size = self.model_info.cola_model_size
             self.target_sparsity = (
                 1 - self.prunable_target_model_size / self.prunable_model_size
             )
@@ -192,23 +190,40 @@ class L0Module(nn.Module):
         ns.hidden_size = cfg.d_model
         ns.attn_hidden_size = getattr(cfg, "attn_hidden_size", ns.hidden_size)
         ns.intermediate_size = cfg.intermediate_size
+        ns.cola_intermediate_size = getattr(
+            cfg, "cola_intermediate_size", ns.intermediate_size
+        )
         ns.mlp_hidden_size = getattr(cfg, "mlp_hidden_size", ns.hidden_size)
         ns.num_attention_heads = cfg.n_heads
-        ns.mlp_num_per_layer = 1
         ns.dim_per_head = ns.hidden_size // ns.num_attention_heads
         ns.num_layers = cfg.n_layers
         ns.vocab_size = cfg.vocab_size
 
         ns.params_per_attn_layer = ns.hidden_size * ns.hidden_size
         ns.params_attn_layer = ns.params_per_attn_layer * 4
-        ns.params_per_attn_hidden_dim = ns.params_per_attn_layer // ns.hidden_size
+        ns.params_per_attn_hidden_dim = 2 * ns.params_per_attn_layer // ns.hidden_size
         ns.params_per_mlp_layer = ns.hidden_size * ns.intermediate_size
         ns.params_mlp_layer = ns.params_per_mlp_layer * n_matrix_mlp
-        ns.params_per_intermediate_dim = ns.params_per_mlp_layer // ns.intermediate_size
-        ns.params_per_mlp_hidden_dim = ns.params_per_mlp_layer // ns.hidden_size
-        
+        ns.params_extra_per_mlp_layer = ns.intermediate_size * ns.intermediate_size
+        ns.params_per_intermediate_dim = (
+            ns.params_per_mlp_layer + ns.params_extra_per_mlp_layer
+        ) // ns.intermediate_size
+        ns.params_per_mlp_hidden_dim = (
+            ns.params_per_mlp_layer + ns.hidden_size * ns.hidden_size
+        ) // ns.hidden_size
+
+        ns.params_per_cola_attn_layer = ns.hidden_size * ns.attn_hidden_size * 2
+        ns.params_cola_attn_layer = ns.params_per_cola_attn_layer * 4
+        ns.params_per_cola_mlp_layer = (
+            ns.hidden_size + ns.intermediate_size
+        ) * ns.cola_intermediate_size
+        ns.params_cola_mlp_layer = ns.params_per_cola_mlp_layer * n_matrix_mlp
+
         ns.full_model_size = (
             ns.params_attn_layer + ns.params_mlp_layer
+        ) * ns.num_layers
+        ns.cola_model_size = (
+            ns.params_cola_attn_layer + ns.params_cola_mlp_layer
         ) * ns.num_layers
         return ns
 
@@ -223,27 +238,30 @@ class L0Module(nn.Module):
         method()
 
     def initialize_attn_hidden(self):
-        mask_shape = [self.base_model_info.num_layers, 4, self.base_model_info.hidden_size]
-        num_params_per_mask = (
-            self.base_model_info.params_per_attn_hidden_dim
-        )
+        mask_shape = [
+            self.model_info.num_layers,
+            4,
+            self.model_info.hidden_size,
+        ]
+        num_params_per_mask = self.model_info.params_per_attn_hidden_dim
         mask_output_shape = [
-            self.base_model_info.num_layers,
+            self.model_info.num_layers,
             4,
             1,
             1,
-            self.base_model_info.hidden_size,
+            self.model_info.hidden_size,
         ]
 
         target_attn_sparsity = None
         pd = None
         target_mask_size = None
-        if self.target_model_info is not None:
+        if self.model_info is not None:
             target_attn_sparsity = (
                 1
-                - self.target_model_info.attn_hidden_size / self.base_model_info.hidden_size
+                - self.model_info.attn_hidden_size
+                / self.model_info.hidden_size
             )
-            target_mask_size = self.target_model_info.attn_hidden_size
+            target_mask_size = self.model_info.attn_hidden_size
             pd = {
                 "lambda_1_attn_hidden": torch.nn.Parameter(
                     torch.tensor([0.0], device=self.device)
@@ -268,29 +286,29 @@ class L0Module(nn.Module):
 
     def initialize_intermediate(self):
         mask_shape = [
-            self.base_model_info.num_layers,
+            self.model_info.num_layers,
             2,
-            self.base_model_info.intermediate_size,
+            self.model_info.intermediate_size,
         ]
-        num_params_per_mask = self.base_model_info.params_per_intermediate_dim
+        num_params_per_mask = self.model_info.params_per_intermediate_dim
         mask_output_shape = [
-            self.base_model_info.num_layers,
+            self.model_info.num_layers,
             2,
             1,
             1,
-            self.base_model_info.intermediate_size,
+            self.model_info.intermediate_size,
         ]
 
         target_int_sparsity = None
         pd = {}
         target_mask_size = None
-        if self.target_model_info is not None:
+        if self.model_info is not None:
             target_int_sparsity = (
                 1
-                - self.target_model_info.intermediate_size
-                / self.base_model_info.intermediate_size
+                - self.model_info.cola_intermediate_size
+                / self.model_info.intermediate_size
             )
-            target_mask_size = self.target_model_info.intermediate_size
+            target_mask_size = self.model_info.cola_intermediate_size
             pd = {
                 "lambda_1_intermediate": torch.nn.Parameter(
                     torch.tensor([0.0], device=self.device)
@@ -315,27 +333,27 @@ class L0Module(nn.Module):
 
     def initialize_mlp_hidden(self):
         mask_shape = [
-            self.base_model_info.num_layers,
-            self.base_model_info.hidden_size,
+            self.model_info.num_layers,
+            self.model_info.hidden_size,
         ]
-        num_params_per_mask = self.base_model_info.params_per_mlp_hidden_dim
+        num_params_per_mask = self.model_info.params_per_mlp_hidden_dim
         mask_output_shape = [
-            self.base_model_info.num_layers,
+            self.model_info.num_layers,
             1,
             1,
-            self.base_model_info.hidden_size,
+            self.model_info.hidden_size,
         ]
 
         target_mlp_hidden_sparsity = None
         pd = {}
         target_mask_size = None
-        if self.target_model_info is not None:
+        if self.model_info is not None:
             target_mlp_hidden_sparsity = (
                 1
-                - self.target_model_info.mlp_hidden_size
-                / self.base_model_info.hidden_size
+                - self.model_info.mlp_hidden_size
+                / self.model_info.hidden_size
             )
-            target_mask_size = self.target_model_info.mlp_hidden_size
+            target_mask_size = self.model_info.mlp_hidden_size
             pd = {
                 "lambda_1_mlp_hidden": torch.nn.Parameter(
                     torch.tensor([0.0], device=self.device)
@@ -379,7 +397,7 @@ class L0Module(nn.Module):
         attn_hidden_score = expected_scores["attn_hidden"]
         int_score = expected_scores["intermediate"]
         mlp_hidden_score = expected_scores["mlp_hidden"]
-        
+
         num_parameters += (
             torch.sum(attn_hidden_score) * self.masks.attn_hidden.num_params_per_mask
         )
@@ -421,7 +439,7 @@ class L0Module(nn.Module):
         expected_sparsity = 1 - expected_size / self.prunable_model_size
 
         return_v = {}
-        if self.target_model_info is None:
+        if self.model_info is None:
             lagrangian_loss = _lag_loss(
                 expected_sparsity,
                 target_sparsity,

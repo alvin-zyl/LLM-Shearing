@@ -74,7 +74,7 @@ from torch.optim.optimizer import Optimizer
 
 from llmshearing.callbacks.callbacks import DebugCallback
 from llmshearing.callbacks.dynamic_loading_callback import DynamicLoadingCallback
-from llmshearing.callbacks.pruning_callback import PruningCallback
+from llmshearing.callbacks.pruning_callback import PruningCallback, CoLACallback
 from llmshearing.datasets.load_text_dataloader import build_text_dataloader
 from llmshearing.models.model_registry import COMPOSER_MODEL_REGISTRY
 from state import State
@@ -119,7 +119,10 @@ def load_state_dict(model: nn.Module, state_dict: Dict[str, Any]):
 
 
 def build_optimizer(
-    model: torch.nn.Module, name: str, optimizer_config: Dict[str, Any], cola_params_only=False
+    model: torch.nn.Module,
+    name: str,
+    optimizer_config: Dict[str, Any],
+    cola_params_only: bool = False,
 ) -> Optimizer:
     """
     build optimizer that consists of three groups of parameters:
@@ -141,6 +144,7 @@ def build_optimizer(
     ]
 
     if cola_model_params and cola_params_only:
+        console_print("Only training added CoLA parameters")
         aux_model_params_names = [
             n for n, p in model.named_parameters() if "ln" in n or "wte" in n
         ]
@@ -148,7 +152,11 @@ def build_optimizer(
             n for n, p in model.named_parameters() if "l0_module" not in n
         ]
         for n, p in model.named_parameters():
-            if n in main_model_params_names and n not in aux_model_params_names and "cola_b" not in n:
+            if (
+                n in main_model_params_names
+                and n not in aux_model_params_names
+                and "cola_b" not in n
+            ):
                 p.requires_grad_(False)
 
     param_groups = [
@@ -322,7 +330,12 @@ def main(cfg):
         evaluators.append(eval_loader)
 
     # Optimizer
-    optimizers = build_optimizer(model, cfg.optimizer.pop("name"), cfg.optimizer)
+    optimizers = build_optimizer(
+        model,
+        cfg.optimizer.pop("name"),
+        cfg.optimizer,
+        getattr(cfg, "cola_params_only", False),
+    )
 
     model = device.module_to_device(model)
     optimizers = map_collection(optimizers, device.optimizer_to_device)
@@ -347,6 +360,8 @@ def main(cfg):
     ]
     if model.model.l0_module is not None:  # pruning callback
         callbacks.append(PruningCallback(save_folder=cfg.save_folder))
+    if cfg.model.get("cola_module") is not None:
+        callbacks.append(CoLACallback(cfg.model.cola_module))
 
     # Algorithms
     algorithms = [

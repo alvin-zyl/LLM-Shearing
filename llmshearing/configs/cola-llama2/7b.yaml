@@ -3,6 +3,7 @@ data_remote: # If blank, files must be present in data_local
 tokenizer_name: meta-llama/Llama-2-7b-hf
 max_seq_len: 4096
 global_seed: 17
+cola_params_only: true
 
 # Run Name
 run_name: # If left blank, will be read from env var $COMPOSER_RUN_NAME
@@ -24,21 +25,19 @@ model:
   emb_pdrop: 0.0
   attn_impl: flash
   rms_norm_eps: 1e-5
-  latent_act_type: silu
-  latent_act_warmup_steps: 640ba
   l0_module:
     start_sparsity: 0.0
     target_sparsity: 0.5
     pruning_modules: ["attn_hidden", "intermediate", "mlp_hidden"]
     lagrangian_warmup_steps: 640ba 
     target_model:
-      d_model: 4096
-      n_heads: 32
-      n_layers: 32
       attn_hidden_size: 1536
-      intermediate_size: 2048
+      cola_intermediate_size: 2048
       mlp_hidden_size: 2048
-      vocab_size: 32000
+  cola_module:
+    latent_act_type: silu
+    latent_act_warmup_steps: 640ba
+    distillation: false
 
 # Tokenizer
 tokenizer:

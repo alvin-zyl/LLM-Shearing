@@ -102,6 +102,7 @@ class ComposerMosaicCoLA(ComposerModel):
                 self.train_metrics[f"{set_name}_count"] = DomainCount(
                     set_name=set_name, set_index=self.set_name_to_id[set_name]
                 )
+        self.distillation = getattr(cfg.cola_module, "distillation", False)
 
     def prune_params(self, zs=None):
         self.model.prune_params(zs)
@@ -117,13 +118,17 @@ class ComposerMosaicCoLA(ComposerModel):
             batch["attention_mask"].bool() if "attention_mask" in batch else None
         )
         pruned_steps = batch.get("pruned_steps", None)
+        latent_act_ratio = batch.get("latent_act_ratio", None)
         if pruned_steps is not None:
             pruned_steps = pruned_steps[0].item()
+        if latent_act_ratio is not None:
+            latent_act_ratio = latent_act_ratio[0].item()
         zs = {key: batch[key] for key in batch if "_z" in key}
         model_output = self.model(
             input_ids=input_ids,
             key_padding_mask=key_padding_mask,
             pruned_steps=pruned_steps,
+            latent_act_ratio=latent_act_ratio,
             **zs,
         )
         return model_output
@@ -143,6 +148,15 @@ class ComposerMosaicCoLA(ComposerModel):
         if l0_output is not None:
             lag_loss = l0_output[0]
             return_loss["lag_loss"] = lag_loss
+        if self.distillation:
+            distill_loss = None
+            for teacher, student in zip(outputs["teacher_features"], outputs["student_features"]):
+                if distill_loss is None:
+                    distill_loss = F.mse_loss(teacher.view(-1), student.view(-1))
+                else:
+                    distill_loss += F.mse_loss(teacher.view(-1), student.view(-1))
+            return_loss["distill"] = distill_loss
+
         return_loss["total"] = sum(return_loss.values())
         return return_loss
 
@@ -358,6 +372,7 @@ class CoLAModel(nn.Module):
         key_padding_mask: Optional[torch.ByteTensor] = None,
         past_key_values: Optional[List[Tuple[torch.FloatTensor]]] = None,
         pruned_steps: int = 0,
+        latent_act_ratio: float = 0.0,
         retain_grad: bool = False,
         **zs,
     ):
@@ -380,23 +395,26 @@ class CoLAModel(nn.Module):
             assert zs == {}, "zs should be empty when using L0Module"
             zs = self.l0_module(calculate_lagrangian=False, pruned_steps=pruned_steps)
 
+        distill_features = {"teacher": [], "student": []}
         for b_idx, block in enumerate(self.transformer.blocks):
             zs_block = self.get_zs_block(zs, b_idx)
             past_key_value = (
                 past_key_values[b_idx] if past_key_values is not None else None
             )
 
-            x, past_key_value = block(
+            x, past_key_value, distill_features_i = block(
                 x,
                 past_key_value=past_key_value,
                 attn_bias=attn_bias,
                 key_padding_mask=key_padding_mask,
                 is_causal=self.is_causal,
                 attention_mask=attention_mask,
-                pruned_steps=pruned_steps,
+                latent_act_ratio=latent_act_ratio,
                 retain_grad=retain_grad,
                 **zs_block,
             )
+            distill_features["teacher"] += distill_features_i["teacher"]
+            distill_features["student"] += distill_features_i["student"]
 
             if past_key_values is not None:
                 past_key_values[b_idx] = past_key_value
@@ -409,7 +427,13 @@ class CoLAModel(nn.Module):
                 calculate_lagrangian=True, pruned_steps=pruned_steps
             )
 
-        return {"logits": logits, "l0_output": l0_output, "zs": zs}
+        return {
+            "logits": logits,
+            "l0_output": l0_output,
+            "zs": zs,
+            "teacher_features": distill_features["teacher"],
+            "student_features": distill_features["student"],
+        }
 
     # Param Initialization, needed for device='meta' fast initialization
     def param_init_fn(self, module):
@@ -466,7 +490,7 @@ class CoLABlock(nn.Module):
         key_padding_mask: Optional[torch.ByteTensor] = None,
         is_causal: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
-        pruned_steps: int = 0,
+        latent_act_ratio: float = 0.0,
         retain_grad: bool = False,
         attn_hidden_z: Optional[torch.Tensor] = None,
         intermediate_z: Optional[torch.Tensor] = None,
@@ -475,14 +499,14 @@ class CoLABlock(nn.Module):
 
         if self.ln_1 is not None:
             a = self.ln_1(x)
-            b, _, past_key_value = self.attn(
+            b, _, past_key_value, attn_distill_features = self.attn(
                 a,
                 past_key_value=past_key_value,
                 attn_bias=attn_bias,
                 key_padding_mask=key_padding_mask,
                 is_causal=is_causal,
                 attention_mask=attention_mask,
-                pruned_steps=pruned_steps,
+                latent_act_ratio=latent_act_ratio,
                 retain_grad=retain_grad,
                 attn_hidden_z=attn_hidden_z,
             )
@@ -492,12 +516,21 @@ class CoLABlock(nn.Module):
 
         if self.ln_2 is not None:
             m = self.ln_2(x)
-            n = self.mlp(m, pruned_steps, retain_grad, intermediate_z, mlp_hidden_z)
+            n, mlp_distill_features = self.mlp(
+                m, latent_act_ratio, retain_grad, intermediate_z, mlp_hidden_z
+            )
         else:
             n = 0
 
         x = x + n
-        return x, past_key_value
+
+        distill_features = {
+            "teacher": attn_distill_features["teacher"]
+            + mlp_distill_features["teacher"],
+            "student": attn_distill_features["student"]
+            + mlp_distill_features["student"],
+        }
+        return x, past_key_value, distill_features
 
 
 def turn_head_z(head_z, head_layer_z):
@@ -533,10 +566,8 @@ class CoLAAttention(nn.Module):
         if self.softmax_scale is None:
             self.softmax_scale = 1 / math.sqrt(self.d_model / self.n_heads)
         self.attn_dropout_p = cfg.get("attn_pdrop")
-        self.latent_act_warmup_steps = Time.from_timestring(
-            cfg.latent_act_warmup_steps
-        ).value
-        self.latent_act = ACT2FN[cfg.latent_act_type]
+        cola_module_cfg = cfg.cola_module
+        self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
 
         # self.Wqkv = nn.Linear(self.d_model, 3 * self.d_model, device=device, bias=False)
         # for param init fn; enables shape based init of fused layers
@@ -697,7 +728,7 @@ class CoLAAttention(nn.Module):
         is_causal=True,
         needs_weights=False,
         attention_mask=None,
-        pruned_steps=0,
+        latent_act_ratio=0.0,
         retain_grad=False,
         attn_hidden_z=None,
     ):
@@ -707,25 +738,26 @@ class CoLAAttention(nn.Module):
         if self.wq is None:
             return None, None, past_key_value
 
-        query = self.wq(x)
-        key = self.wk(x)
-        value = self.wv(x)
-
-        if pruned_steps <= self.latent_act_warmup_steps:
-            inject_act_ratio = pruned_steps / self.latent_act_warmup_steps
-        else:
-            inject_act_ratio = 1.0
+        query_t = self.wq(x)
+        key_t = self.wk(x)
+        value_t = self.wv(x)
 
         query = self.wq_cola_b(
-            (inject_act_ratio * self.latent_act(query) + (1 - inject_act_ratio) * query)
+            (
+                latent_act_ratio * self.latent_act(query_t)
+                + (1 - latent_act_ratio) * query_t
+            )
             * attn_hidden_z[0]
         )
         key = self.wk_cola_b(
-            (inject_act_ratio * self.latent_act(key) + (1 - inject_act_ratio) * key)
+            (latent_act_ratio * self.latent_act(key_t) + (1 - latent_act_ratio) * key_t)
             * attn_hidden_z[1]
         )
         value = self.wv_cola_b(
-            (inject_act_ratio * self.latent_act(value) + (1 - inject_act_ratio) * value)
+            (
+                latent_act_ratio * self.latent_act(value_t)
+                + (1 - latent_act_ratio) * value_t
+            )
             * attn_hidden_z[2]
         )
 
@@ -788,11 +820,11 @@ class CoLAAttention(nn.Module):
             if self.context.requires_grad:
                 self.context.retain_grad()
 
-        output = self.out_proj(context)
+        output_t = self.out_proj(context)
         output = self.out_proj_cola_b(
             (
-                inject_act_ratio * self.latent_act(output)
-                + (1 - inject_act_ratio) * output
+                latent_act_ratio * self.latent_act(output_t)
+                + (1 - latent_act_ratio) * output_t
             )
             * attn_hidden_z[3]
         )
@@ -802,7 +834,12 @@ class CoLAAttention(nn.Module):
             if self.output.requires_grad:
                 self.output.retain_grad()
 
-        return output, attn_weights, past_key_value
+        distill_features = {
+            "teacher": [query_t, key_t, value_t, output_t],
+            "student": [query, key, value, output],
+        }
+
+        return output, attn_weights, past_key_value, distill_features
 
 
 class CoLAMLP(nn.Module):
@@ -824,10 +861,8 @@ class CoLAMLP(nn.Module):
         self.up_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
         self.down_proj_cola_b = CoLAUpProjLayer(cfg.d_model)
 
-        self.latent_act_warmup_steps = Time.from_timestring(
-            cfg.latent_act_warmup_steps
-        ).value
-        self.latent_act = ACT2FN[cfg.latent_act_type]
+        cola_module_cfg = cfg.cola_module
+        self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
 
     def prune_params(self, zs_block):
         intermediate_z = zs_block.get("intermediate_z", None)
@@ -889,28 +924,22 @@ class CoLAMLP(nn.Module):
     def forward(
         self,
         x,
-        pruned_steps=0,
+        latent_act_ratio=0.0,
         retain_grad=False,
         intermediate_z=None,
         mlp_hidden_z=None,
     ):
         if self.up_proj is None:
             return None
-        gate = F.silu(self.gate_proj(x))
-
-        if pruned_steps <= self.latent_act_warmup_steps:
-            inject_act_ratio = pruned_steps / self.latent_act_warmup_steps
-        else:
-            inject_act_ratio = 1.0
-
-        up_v = self.up_proj(x)
+        gate_t = F.silu(self.gate_proj(x))
+        up_v_t = self.up_proj(x)
 
         if intermediate_z is not None:
-            gate = self.gate_proj_cola_b(gate * intermediate_z[0])
+            gate = self.gate_proj_cola_b(gate_t * intermediate_z[0])
             up_v = self.up_proj_cola_b(
                 (
-                    inject_act_ratio * self.latent_act(up_v)
-                    + (1 - inject_act_ratio) * up_v
+                    latent_act_ratio * self.latent_act(up_v_t)
+                    + (1 - latent_act_ratio) * up_v_t
                 )
                 * intermediate_z[1]
             )
@@ -919,13 +948,13 @@ class CoLAMLP(nn.Module):
             self.up_v = up_v
             if self.up_v.requires_grad:
                 self.up_v.retain_grad()
-        down_v = self.down_proj(gate * up_v)
+        down_v_t = self.down_proj(gate * up_v)
 
         if mlp_hidden_z is not None:
             down_v = self.down_proj_cola_b(
                 (
-                    inject_act_ratio * self.latent_act(down_v)
-                    + (1 - inject_act_ratio) * down_v
+                    latent_act_ratio * self.latent_act(down_v_t)
+                    + (1 - latent_act_ratio) * down_v_t
                 )
                 * mlp_hidden_z
             )
@@ -935,7 +964,12 @@ class CoLAMLP(nn.Module):
             if self.output.requires_grad:
                 self.output.retain_grad()
 
-        return down_v
+        distill_features = {
+            "teacher": [gate_t, up_v_t, down_v_t],
+            "student": [gate, up_v, down_v],
+        }
+
+        return down_v, distill_features
 
 
 def check_valid_inputs(*tensors, valid_dtypes=[torch.float16, torch.bfloat16]):
