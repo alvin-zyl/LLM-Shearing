@@ -1276,7 +1276,7 @@ class State(Serializable):
         if self.load_fsdp_monolith_rank0_only:
             assert self.fsdp_config is not None
             log.info("Wrapping model with FSDP after loading model_state.")
-            from composer.trainer.dist_strategy import prepare_fsdp_module
+            from dist_strategy import prepare_fsdp_module
 
             prepare_fsdp_module(
                 self.model,

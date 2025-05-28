@@ -40,7 +40,7 @@ from composer.core import (
     Timestamp,
     Time,
 )
-from composer.trainer.dist_strategy import prepare_ddp_module, prepare_fsdp_module
+from dist_strategy import prepare_ddp_module, prepare_fsdp_module
 from composer.trainer._scaler import ClosureGradScaler
 from torch.cuda.amp.grad_scaler import GradScaler
 from composer.optim import ComposerScheduler, compile_composer_scheduler

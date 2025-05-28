@@ -37,7 +37,7 @@ model:
   cola_module:
     latent_act_type: silu
     latent_act_warmup_steps: 640ba
-    distillation: false
+    distillation: true
 
 # Tokenizer
 tokenizer:
