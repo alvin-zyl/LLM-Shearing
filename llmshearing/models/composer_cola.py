@@ -149,13 +149,7 @@ class ComposerMosaicCoLA(ComposerModel):
             lag_loss = l0_output[0]
             return_loss["lag_loss"] = lag_loss
         if self.distillation:
-            distill_loss = None
-            for teacher, student in zip(outputs["teacher_features"], outputs["student_features"]):
-                if distill_loss is None:
-                    distill_loss = F.mse_loss(teacher.view(-1), student.view(-1))
-                else:
-                    distill_loss += F.mse_loss(teacher.view(-1), student.view(-1))
-            return_loss["distill"] = distill_loss
+            return_loss["distill"] = outputs["distill_loss"]
 
         return_loss["total"] = sum(return_loss.values())
         return return_loss
@@ -271,6 +265,7 @@ class CoLAModel(nn.Module):
         )
 
         self.is_causal = True
+        self.distillation = getattr(cfg.cola_module, "distillation", False)
 
         # define attn mask
         self._attn_bias_initialized = False
@@ -395,14 +390,14 @@ class CoLAModel(nn.Module):
             assert zs == {}, "zs should be empty when using L0Module"
             zs = self.l0_module(calculate_lagrangian=False, pruned_steps=pruned_steps)
 
-        distill_features = {"teacher": [], "student": []}
+        distill_loss = None
         for b_idx, block in enumerate(self.transformer.blocks):
             zs_block = self.get_zs_block(zs, b_idx)
             past_key_value = (
                 past_key_values[b_idx] if past_key_values is not None else None
             )
 
-            x, past_key_value, distill_features_i = block(
+            x, past_key_value, distill_loss_i = block(
                 x,
                 past_key_value=past_key_value,
                 attn_bias=attn_bias,
@@ -413,8 +408,12 @@ class CoLAModel(nn.Module):
                 retain_grad=retain_grad,
                 **zs_block,
             )
-            distill_features["teacher"] += distill_features_i["teacher"]
-            distill_features["student"] += distill_features_i["student"]
+            
+            if self.distillation:
+                if distill_loss is None:
+                    distill_loss = distill_loss_i
+                else:
+                    distill_loss += distill_loss_i
 
             if past_key_values is not None:
                 past_key_values[b_idx] = past_key_value
@@ -431,8 +430,7 @@ class CoLAModel(nn.Module):
             "logits": logits,
             "l0_output": l0_output,
             "zs": zs,
-            "teacher_features": distill_features["teacher"],
-            "student_features": distill_features["student"],
+            "distill_loss": distill_loss
         }
 
     # Param Initialization, needed for device='meta' fast initialization
@@ -465,6 +463,7 @@ class CoLABlock(nn.Module):
             cfg.d_model, cfg.get("rms_norm_eps", 1e-6), device=device
         )
         self.mlp = CoLAMLP(cfg, device)
+        self.distillation = getattr(cfg.cola_module, "distillation", False)
 
     def prune_params(self, zs_block):
         self.attn.prune_params(zs_block)
@@ -499,7 +498,7 @@ class CoLABlock(nn.Module):
 
         if self.ln_1 is not None:
             a = self.ln_1(x)
-            b, _, past_key_value, attn_distill_features = self.attn(
+            b, _, past_key_value, attn_distill_loss = self.attn(
                 a,
                 past_key_value=past_key_value,
                 attn_bias=attn_bias,
@@ -516,7 +515,7 @@ class CoLABlock(nn.Module):
 
         if self.ln_2 is not None:
             m = self.ln_2(x)
-            n, mlp_distill_features = self.mlp(
+            n, mlp_distill_loss = self.mlp(
                 m, latent_act_ratio, retain_grad, intermediate_z, mlp_hidden_z
             )
         else:
@@ -524,13 +523,12 @@ class CoLABlock(nn.Module):
 
         x = x + n
 
-        distill_features = {
-            "teacher": attn_distill_features["teacher"]
-            + mlp_distill_features["teacher"],
-            "student": attn_distill_features["student"]
-            + mlp_distill_features["student"],
-        }
-        return x, past_key_value, distill_features
+        if self.distillation:
+            distill_loss = attn_distill_loss + mlp_distill_loss
+        else:
+            distill_loss = None
+
+        return x, past_key_value, distill_loss
 
 
 def turn_head_z(head_z, head_layer_z):
@@ -568,6 +566,7 @@ class CoLAAttention(nn.Module):
         self.attn_dropout_p = cfg.get("attn_pdrop")
         cola_module_cfg = cfg.cola_module
         self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
+        self.distillation = getattr(cola_module_cfg, "distillation", False)
 
         # self.Wqkv = nn.Linear(self.d_model, 3 * self.d_model, device=device, bias=False)
         # for param init fn; enables shape based init of fused layers
@@ -761,6 +760,15 @@ class CoLAAttention(nn.Module):
             * attn_hidden_z[2]
         )
 
+        if self.distillation:
+            distill_loss = (
+                F.mse_loss(query, query_t)
+                + F.mse_loss(key, key_t)
+                + F.mse_loss(value, value_t)
+            )
+        else:
+            distill_loss = None
+
         query_padding_mask = None
         if key_padding_mask is not None:
             query_padding_mask = key_padding_mask[:, -query.size(1) :]
@@ -829,17 +837,15 @@ class CoLAAttention(nn.Module):
             * attn_hidden_z[3]
         )
 
+        if self.distillation:
+            distill_loss += F.mse_loss(output, output_t)
+
         if retain_grad:
             self.output = output
             if self.output.requires_grad:
                 self.output.retain_grad()
 
-        distill_features = {
-            "teacher": [query_t, key_t, value_t, output_t],
-            "student": [query, key, value, output],
-        }
-
-        return output, attn_weights, past_key_value, distill_features
+        return output, attn_weights, past_key_value, distill_loss
 
 
 class CoLAMLP(nn.Module):
@@ -863,6 +869,7 @@ class CoLAMLP(nn.Module):
 
         cola_module_cfg = cfg.cola_module
         self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
+        self.distillation = getattr(cola_module_cfg, "distillation", False)
 
     def prune_params(self, zs_block):
         intermediate_z = zs_block.get("intermediate_z", None)
@@ -943,6 +950,12 @@ class CoLAMLP(nn.Module):
                 )
                 * intermediate_z[1]
             )
+        else:
+            gate = self.gate_proj_cola_b(gate_t)
+            up_v = self.up_proj_cola_b(
+                latent_act_ratio * self.latent_act(up_v_t)
+                + (1 - latent_act_ratio) * up_v_t
+            )
 
         if retain_grad:
             self.up_v = up_v
@@ -958,18 +971,27 @@ class CoLAMLP(nn.Module):
                 )
                 * mlp_hidden_z
             )
+        else:
+            down_v = self.down_proj_cola_b(
+                latent_act_ratio * self.latent_act(down_v_t)
+                + (1 - latent_act_ratio) * down_v_t
+            )
+
+        if self.distillation:
+            distill_loss = (
+                F.mse_loss(gate, gate_t)
+                + F.mse_loss(up_v, up_v_t)
+                + F.mse_loss(down_v, down_v_t)
+            )
+        else:
+            distill_loss = None
 
         if retain_grad:
             self.output = down_v
             if self.output.requires_grad:
                 self.output.retain_grad()
 
-        distill_features = {
-            "teacher": [gate_t, up_v_t, down_v_t],
-            "student": [gate, up_v, down_v],
-        }
-
-        return down_v, distill_features
+        return down_v, distill_loss
 
 
 def check_valid_inputs(*tensors, valid_dtypes=[torch.float16, torch.bfloat16]):
