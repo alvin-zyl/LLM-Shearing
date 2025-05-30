@@ -1,5 +1,5 @@
 import math
-import warnings
+import warnings, itertools
 from typing import List, Optional, Tuple
 
 import torch
@@ -408,7 +408,7 @@ class CoLAModel(nn.Module):
                 retain_grad=retain_grad,
                 **zs_block,
             )
-            
+
             if self.distillation:
                 if distill_loss is None:
                     distill_loss = distill_loss_i
@@ -430,7 +430,7 @@ class CoLAModel(nn.Module):
             "logits": logits,
             "l0_output": l0_output,
             "zs": zs,
-            "distill_loss": distill_loss
+            "distill_loss": distill_loss,
         }
 
     # Param Initialization, needed for device='meta' fast initialization
@@ -567,6 +567,14 @@ class CoLAAttention(nn.Module):
         cola_module_cfg = cfg.cola_module
         self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
         self.distillation = getattr(cola_module_cfg, "distillation", False)
+        self.calibration = getattr(cola_module_cfg, "calibration", False)
+        if self.calibration:
+            self.calib_states = {
+                "_".join(ks): None
+                for ks in itertools.product(
+                    ["wq", "wk", "wv", "out_proj"], ["sts", "stu"]
+                )
+            }
 
         # self.Wqkv = nn.Linear(self.d_model, 3 * self.d_model, device=device, bias=False)
         # for param init fn; enables shape based init of fused layers
@@ -576,16 +584,22 @@ class CoLAAttention(nn.Module):
         self.wk = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
         self.wv = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
 
-        self.wq_cola_b = CoLAUpProjLayer(self.d_model)
-        self.wk_cola_b = CoLAUpProjLayer(self.d_model)
-        self.wv_cola_b = CoLAUpProjLayer(self.d_model)
-
         self.attn_fn = flash_attn_fn if self.attn_impl == "flash" else normal_attn_fn
 
         self.out_proj = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
         self.out_proj._is_residual = True  # type: ignore
 
-        self.out_proj_cola_b = CoLAUpProjLayer(self.d_model)
+        self.delay_init_cola_params = getattr(
+            cola_module_cfg, "delay_init_cola_params", False
+        )
+        if not self.delay_init_cola_params:
+            self.cola_initialized = True
+            self.wq_cola_b = CoLAUpProjLayer(self.d_model)
+            self.wk_cola_b = CoLAUpProjLayer(self.d_model)
+            self.wv_cola_b = CoLAUpProjLayer(self.d_model)
+            self.out_proj_cola_b = CoLAUpProjLayer(self.d_model)
+        else:
+            self.cola_initialized = False
 
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim)
 
@@ -741,24 +755,50 @@ class CoLAAttention(nn.Module):
         key_t = self.wk(x)
         value_t = self.wv(x)
 
-        query = self.wq_cola_b(
-            (
+        if self.calibration:
+
+            def calib_cola_params(modules, tensors):
+                with torch.no_grad():
+                    for k, u in zip(modules, tensors):
+                        u = u.view(-1, u.shape[-1])
+                        s = self.latent_act(u)
+                        sts = torch.matmul(s.t(), s).cpu()
+                        stu = torch.matmul(s.t(), u).cpu()
+                        for n, r in zip([k + "_sts", k + "_stu"], [sts, stu]):
+                            if self.calib_states[n] is None:
+                                self.calib_states[n] = r
+                            else:
+                                self.calib_states[n] += r
+
+            calib_cola_params(["wq", "wk", "wv"], [query_t, key_t, value_t])
+
+        if latent_act_ratio > 0:
+            query = (
                 latent_act_ratio * self.latent_act(query_t)
                 + (1 - latent_act_ratio) * query_t
             )
-            * attn_hidden_z[0]
-        )
-        key = self.wk_cola_b(
-            (latent_act_ratio * self.latent_act(key_t) + (1 - latent_act_ratio) * key_t)
-            * attn_hidden_z[1]
-        )
-        value = self.wv_cola_b(
-            (
+            key = (
+                latent_act_ratio * self.latent_act(key_t)
+                + (1 - latent_act_ratio) * key_t
+            )
+            value = (
                 latent_act_ratio * self.latent_act(value_t)
                 + (1 - latent_act_ratio) * value_t
             )
-            * attn_hidden_z[2]
-        )
+        else:
+            query = query_t
+            key = key_t
+            value = value_t
+
+        if attn_hidden_z is not None:
+            query *= attn_hidden_z[0]
+            key *= attn_hidden_z[1]
+            value *= attn_hidden_z[2]
+
+        if self.cola_initialized:
+            query = self.wq_cola_b(query)
+            key = self.wq_cola_b(key)
+            value = self.wq_cola_b(value)
 
         if self.distillation:
             distill_loss = (
@@ -829,13 +869,23 @@ class CoLAAttention(nn.Module):
                 self.context.retain_grad()
 
         output_t = self.out_proj(context)
-        output = self.out_proj_cola_b(
-            (
+
+        if self.calibration:
+            calib_cola_params(["out_proj"], [output_t])
+
+        if latent_act_ratio > 0:
+            output = (
                 latent_act_ratio * self.latent_act(output_t)
                 + (1 - latent_act_ratio) * output_t
             )
-            * attn_hidden_z[3]
-        )
+        else:
+            output = output_t
+
+        if attn_hidden_z is not None:
+            output *= attn_hidden_z[3]
+
+        if self.cola_initialized:
+            output = self.out_proj_cola_b(output)
 
         if self.distillation:
             distill_loss += F.mse_loss(output, output_t)
@@ -863,13 +913,28 @@ class CoLAMLP(nn.Module):
         )
         self.down_proj._is_residule = True  # type: ignore
 
-        self.gate_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
-        self.up_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
-        self.down_proj_cola_b = CoLAUpProjLayer(cfg.d_model)
-
         cola_module_cfg = cfg.cola_module
         self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
         self.distillation = getattr(cola_module_cfg, "distillation", False)
+        self.delay_init_cola_params = getattr(
+            cola_module_cfg, "delay_init_cola_params", False
+        )
+        self.calibration = getattr(cola_module_cfg, "calibration", False)
+        if self.calibration:
+            self.calib_states = {
+                "_".join(ks): None
+                for ks in itertools.product(
+                    ["down_proj", "up_proj"], ["sts", "stu"]
+                )
+            }
+
+        if not self.delay_init_cola_params:
+            self.cola_initialized = True
+            self.gate_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
+            self.up_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
+            self.down_proj_cola_b = CoLAUpProjLayer(cfg.d_model)
+        else:
+            self.cola_initialized = False
 
     def prune_params(self, zs_block):
         intermediate_z = zs_block.get("intermediate_z", None)
@@ -941,21 +1006,23 @@ class CoLAMLP(nn.Module):
         gate_t = F.silu(self.gate_proj(x))
         up_v_t = self.up_proj(x)
 
-        if intermediate_z is not None:
-            gate = self.gate_proj_cola_b(gate_t * intermediate_z[0])
-            up_v = self.up_proj_cola_b(
-                (
-                    latent_act_ratio * self.latent_act(up_v_t)
-                    + (1 - latent_act_ratio) * up_v_t
-                )
-                * intermediate_z[1]
-            )
-        else:
-            gate = self.gate_proj_cola_b(gate_t)
-            up_v = self.up_proj_cola_b(
+        if latent_act_ratio > 0:
+            up_v = (
                 latent_act_ratio * self.latent_act(up_v_t)
                 + (1 - latent_act_ratio) * up_v_t
             )
+        else:
+            up_v = up_v_t
+
+        if intermediate_z is not None:
+            gate *= intermediate_z[0]
+            up_v *= intermediate_z[1]
+        else:
+            gate = gate_t
+
+        if not self.cola_initialized:
+            gate = self.gate_proj_cola_b(gate)
+            up_v = self.up_proj_cola_b(up_v)
 
         if retain_grad:
             self.up_v = up_v
@@ -963,19 +1030,37 @@ class CoLAMLP(nn.Module):
                 self.up_v.retain_grad()
         down_v_t = self.down_proj(gate * up_v)
 
-        if mlp_hidden_z is not None:
-            down_v = self.down_proj_cola_b(
-                (
-                    latent_act_ratio * self.latent_act(down_v_t)
-                    + (1 - latent_act_ratio) * down_v_t
-                )
-                * mlp_hidden_z
-            )
-        else:
-            down_v = self.down_proj_cola_b(
+        if latent_act_ratio > 0:
+            down_v = (
                 latent_act_ratio * self.latent_act(down_v_t)
                 + (1 - latent_act_ratio) * down_v_t
             )
+        else:
+            down_v = down_v_t
+
+        if mlp_hidden_z is not None:
+            down_v *= mlp_hidden_z
+
+        if not self.cola_initialized:
+            down_v = self.down_proj_cola_b(down_v)
+
+        if self.calibration:
+
+            def calib_cola_params(modules, tensors):
+                with torch.no_grad():
+                    for k, u in zip(modules, tensors):
+                        u = u.view(-1, u.shape[-1])
+                        s = self.latent_act(u)
+                        sts = torch.matmul(s.t(), s).cpu()
+                        stu = torch.matmul(s.t(), u).cpu()
+                        for n, r in zip([k + "_sts", k + "_stu"], [sts, stu]):
+                            if self.calib_states[n] is None:
+                                self.calib_states[n] = r
+                            else:
+                                self.calib_states[n] += r
+            
+            calib_cola_params(["up_proj", "down_proj"], [up_v_t, down_v_t])
+
 
         if self.distillation:
             distill_loss = (
