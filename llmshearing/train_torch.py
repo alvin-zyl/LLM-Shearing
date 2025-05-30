@@ -103,7 +103,7 @@ def build_composer_model(cfg: DictConfig):
 def load_weights(cfg: DictConfig):
     """load weights"""
     if cfg.model.get("path", None):
-        state_dict = torch.load(cfg.model.path)  # for loading pre-trained llama
+        state_dict = torch.load(cfg.model.path, mmap=True)  # for loading pre-trained llama
         if "state" in state_dict:
             state_dict = state_dict["state"]["model"]
         console_print(f"Loaded model from path: {cfg.model.path}")
@@ -249,18 +249,6 @@ def main(cfg):
     fsdp_config = cfg.get("fsdp_config", None)
     fsdp_config = om.to_container(fsdp_config, resolve=True) if fsdp_config else None
 
-    # Restrict model init_device to 'meta' and 'cpu',
-    # when multiple GPUs are available.
-    # Also 'meta' is only valid when using FSDP
-    init_device = cfg.model.get("init_device", "cpu")
-    assert init_device in ["meta", "cpu"]
-    if fsdp_config is None and init_device == "meta":
-        warnings.warn(
-            "Using `cfg.model.init_device='meta'` is only valid when using FSDP! "
-            + "Reverting to `cfg.model.init_device='cpu'`."
-        )
-        cfg.model.init_device = "cpu"
-
     save_folder = cfg.save_folder.replace("{run_name}", cfg.run_name)
     filename = f"{save_folder}/logs.log"
     count = 1
@@ -288,10 +276,15 @@ def main(cfg):
     model = build_composer_model(cfg.model)
     console_print(model)
     console_print(cfg.model.l0_module)
+    console_print("Initialized model")
 
+    console_print("Loading state dicts")
     state_dict = load_weights(cfg)
+    console_print("Loaded state dicts")
     if state_dict is not None:
+        console_print("Loading weights")
         load_state_dict(model, state_dict)
+        console_print("Loaded weights")
 
     cfg.n_params = sum(p.numel() for p in model.parameters())
     console_print(f"{cfg.n_params=:.2e}")
@@ -337,8 +330,9 @@ def main(cfg):
         getattr(cfg, "cola_params_only", False),
     )
 
-    model = device.module_to_device(model)
-    optimizers = map_collection(optimizers, device.optimizer_to_device)
+    if fsdp_config is None:
+        model = device.module_to_device(model)
+        optimizers = map_collection(optimizers, device.optimizer_to_device)
 
     # Scheduler
     schedulers = build_scheduler(cfg.scheduler.pop("name"), cfg.scheduler)
