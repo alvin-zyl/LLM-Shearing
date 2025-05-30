@@ -63,6 +63,8 @@ class CoLACallback(Callback):
 
     def __init__(self, cfg: DictConfig = None):
         super().__init__()
+        self.latent_act_schedule = getattr(cfg, "latent_act_schedule", "constant")
+        self.latent_act_ratio = getattr(cfg, "latent_act_ratio", 0.0)
         self.latent_act_warmup_steps = (
             Time.from_timestring(cfg.latent_act_warmup_steps).value
             if hasattr(cfg, "latent_act_warmup_steps")
@@ -71,16 +73,23 @@ class CoLACallback(Callback):
 
     def plug_in_latent_act_ratio(self, state: State, logger: Logger):
         """Hack: Add pruned_steps to the batch to calculate target sparsity during the pruning warmup stage"""
-        if self.latent_act_warmup_steps is not None:
-            input_ids = state.batch["input_ids"]
+        input_ids = state.batch["input_ids"]
+        if self.latent_act_schedule != "constant":
             state.batch["latent_act_ratio"] = torch.Tensor(
                 [min(1.0, state.timestamp.batch.value / self.latent_act_warmup_steps)]
                 * len(input_ids)
             ).to(input_ids.device)
+        else:
+            state.batch["latent_act_ratio"] = torch.Tensor(
+                [self.latent_act_ratio] * len(input_ids)
+            ).to(input_ids.device)
 
-            logger.log_metrics(
-                {"latent_act_ratio": state.batch["latent_act_ratio"][0].item()}
-            )
+        logger.log_metrics(
+            {"latent_act_ratio": state.batch["latent_act_ratio"][0].item()}
+        )
 
     def batch_start(self, state: State, logger: Logger):
+        self.plug_in_latent_act_ratio(state, logger)
+
+    def eval_batch_start(self, state: State, logger: Logger):
         self.plug_in_latent_act_ratio(state, logger)
