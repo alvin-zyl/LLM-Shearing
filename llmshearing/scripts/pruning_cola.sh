@@ -1,7 +1,7 @@
 #!/bin/sh
 #SBATCH -A m4788_g
 #SBATCH -q premium
-#SBATCH -C gpu&hbm40g
+#SBATCH -C gpu&hbm80g
 #SBATCH -t 1:00:00
 #SBATCH --image=alvinliu12138/zhanggroup:shearllm
 #SBATCH --gpus-per-node=4
@@ -25,9 +25,11 @@ path=$MODEL_PATH/state_dict.pt
 data_local=${DATA_DIR}
 
 # basic setup
+BZ=${BZ:-"2"}
+TBZ=${TBZ:-"32"}
 max_seq_len=4096
-device_train_microbatch_size=2
-global_train_batch_size=32
+device_train_microbatch_size=$BZ
+global_train_batch_size=$TBZ
 device_eval_batch_size=8
 
 # learning setup
@@ -107,7 +109,7 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     optimizer.lag_lr=${lag_lr} \
     model.path=${path} \
     model.l0_module.lagrangian_warmup_steps=${lagr_warmup} \
-    model.l0_module.pruning_modules='[head,intermediate,hidden]' \
+    model.l0_module.pruning_modules='[attn_hidden,intermediate,mlp_hidden]' \
     model.l0_module.eval_target_model=${eval_target_model} \
     model.l0_module.target_model.attn_hidden_size=${target_attn_hidden_size} \
     model.l0_module.target_model.cola_intermediate_size=${target_cola_intermediate_size} \
