@@ -818,7 +818,7 @@ class CoLAAttention(nn.Module):
         else:
             distill_loss = None
 
-        if self.distill_cola_params_only:
+        if self.distill_cola_params_only and self.training:
             query = query_t
             key = key_t
             value = value_t
@@ -908,7 +908,7 @@ class CoLAAttention(nn.Module):
         if self.distillation:
             distill_loss += F.mse_loss(output_s, output_t)
 
-        if self.distill_cola_params_only:
+        if self.distill_cola_params_only and self.training:
             output = output_t
         else:
             output = output_s
@@ -1053,7 +1053,7 @@ class CoLAMLP(nn.Module):
         else:
             distill_loss = None
         
-        if self.distill_cola_params_only:
+        if self.distill_cola_params_only and self.training:
             gate = gate_t
             up_v = up_v_t
         else:
@@ -1101,7 +1101,7 @@ class CoLAMLP(nn.Module):
         if self.distillation:
             distill_loss += F.mse_loss(down_v_s, down_v_t)
 
-        if self.distill_cola_params_only:
+        if self.distill_cola_params_only and self.training:
             down_v = down_v_t
         else:
             down_v = down_v_s
