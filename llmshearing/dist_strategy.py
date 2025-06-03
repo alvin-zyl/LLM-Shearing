@@ -296,34 +296,31 @@ def prepare_fsdp_module(
         optim = optimizers_tuple[0]
 
         num_param_groups = len(optim.param_groups)
-        if num_param_groups > 1:
-            if not (is_torch_2_0 and kwargs['use_orig_params']):
-                raise RuntimeError('Multiple optimizer groups with FSDP are only supported on torch 2.0 \
-                                   with use_orig_params=True.')
-            # optimizer.param_groups do not contain parameter names which are needed
-            # to keep track of the different parameters in each group
-            # so we use the pointers between model.parameters() and model.named_parameters()
-            # to get the names of the parameters within optimizer.param_groups
-            param_pointer_to_param_name = {id(p): n for n, p in model.named_parameters()}
-            param_name_to_group_num = {}
-            group_num_to_param_group_info = {}
-            for group_num in range(len(optim.param_groups)):
+        if not (is_torch_2_0 and kwargs['use_orig_params']):
+            raise RuntimeError('Multiple optimizer groups with FSDP are only supported on torch 2.0 \
+                                with use_orig_params=True.')
+        # optimizer.param_groups do not contain parameter names which are needed
+        # to keep track of the different parameters in each group
+        # so we use the pointers between model.parameters() and model.named_parameters()
+        # to get the names of the parameters within optimizer.param_groups
+        param_pointer_to_param_name = {id(p): n for n, p in model.named_parameters()}
+        param_name_to_group_num = {}
+        group_num_to_param_group_info = {}
+        for group_num in range(len(optim.param_groups)):
+            # Need to in-line to avoid a reference which causes FSDP to allocate extra GPU memory
+            # group = optim.param_groups[group_num]
+            for param_num in range(len(optim.param_groups[group_num]['params'])):
                 # Need to in-line to avoid a reference which causes FSDP to allocate extra GPU memory
-                # group = optim.param_groups[group_num]
-                for param_num in range(len(optim.param_groups[group_num]['params'])):
-                    # Need to in-line to avoid a reference which causes FSDP to allocate extra GPU memory
-                    # param = optim.param_groups[group_num]['params'][param_num]
-                    param_name_to_group_num[param_pointer_to_param_name[id(
-                        optim.param_groups[group_num]['params'][param_num])]] = group_num
+                # param = optim.param_groups[group_num]['params'][param_num]
+                param_name_to_group_num[param_pointer_to_param_name[id(
+                    optim.param_groups[group_num]['params'][param_num])]] = group_num
 
-                # this includes optimizer-specific values like lr, eps
-                # this will be used as the kwargs for the optim param groups later
-                optimizer_specific_group_info = {
-                    k: v for k, v in optim.param_groups[group_num].items() if k != 'params'
-                }
-                group_num_to_param_group_info[group_num] = optimizer_specific_group_info
-        else:
-            optimizer_specific_info = {k: v for k, v in optim.param_groups[0].items() if k != 'params'}
+            # this includes optimizer-specific values like lr, eps
+            # this will be used as the kwargs for the optim param groups later
+            optimizer_specific_group_info = {
+                k: v for k, v in optim.param_groups[group_num].items() if k != 'params'
+            }
+            group_num_to_param_group_info[group_num] = optimizer_specific_group_info
 
         optim.param_groups.clear()
         optim.state.clear()
@@ -571,16 +568,11 @@ def prepare_fsdp_module(
         optim.param_groups.clear()
 
         assert num_param_groups is not None
-        if num_param_groups > 1:
-            assert param_name_to_group_num is not None
-            assert group_num_to_param_group_info is not None
+        assert param_name_to_group_num is not None
+        assert group_num_to_param_group_info is not None
 
-            param_groups = _recreate_fsdp_param_groups_from_unwrapped_opt_info(model.named_parameters(),
-                                                                               param_name_to_group_num,
-                                                                               group_num_to_param_group_info)
-            for param_group in param_groups:
-                optim.add_param_group(param_group)
-        else:
-            assert optimizer_specific_info is not None
-            optimizer_specific_info.update({'params': list(model.parameters())})
-            optim.add_param_group(optimizer_specific_info)
+        param_groups = _recreate_fsdp_param_groups_from_unwrapped_opt_info(model.named_parameters(),
+                                                                            param_name_to_group_num,
+                                                                            group_num_to_param_group_info)
+        for param_group in param_groups:
+            optim.add_param_group(param_group)

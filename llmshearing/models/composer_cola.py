@@ -103,6 +103,9 @@ class ComposerMosaicCoLA(ComposerModel):
                     set_name=set_name, set_index=self.set_name_to_id[set_name]
                 )
         self.distillation = getattr(cfg.cola_module, "distillation", False)
+        self.distill_cola_params_only = getattr(
+            cfg.cola_module, "distill_cola_params_only", False
+        )
 
     def prune_params(self, zs=None):
         self.model.prune_params(zs)
@@ -151,7 +154,10 @@ class ComposerMosaicCoLA(ComposerModel):
         if self.distillation:
             return_loss["distill"] = outputs["distill_loss"]
 
-        return_loss["total"] = sum(return_loss.values())
+        if self.distill_cola_params_only:
+            return_loss["total"] = return_loss["distill"]
+        else:
+            return_loss["total"] = sum(return_loss.values())
         return return_loss
 
     def get_metrics(self, is_train=False):
@@ -575,6 +581,9 @@ class CoLAAttention(nn.Module):
                     ["wq", "wk", "wv", "out_proj"], ["sts", "stu"]
                 )
             }
+        self.distill_cola_params_only = getattr(
+            cola_module_cfg, "distill_cola_params_only", False
+        )
 
         # self.Wqkv = nn.Linear(self.d_model, 3 * self.d_model, device=device, bias=False)
         # for param init fn; enables shape based init of fused layers
@@ -762,52 +771,61 @@ class CoLAAttention(nn.Module):
                     for k, u in zip(modules, tensors):
                         u = u.view(-1, u.shape[-1])
                         s = self.latent_act(u)
-                        sts = torch.matmul(s.t(), s).cpu()
-                        stu = torch.matmul(s.t(), u).cpu()
+                        sts = torch.matmul(s.t(), s)
+                        stu = torch.matmul(s.t(), u)
                         for n, r in zip([k + "_sts", k + "_stu"], [sts, stu]):
                             if self.calib_states[n] is None:
-                                self.calib_states[n] = r
+                                self.calib_states[n] = r.cpu()
                             else:
-                                self.calib_states[n] += r
+                                self.calib_states[n] += r.cpu()
 
             calib_cola_params(["wq", "wk", "wv"], [query_t, key_t, value_t])
 
         if latent_act_ratio > 0:
-            query = (
+            query_s = (
                 latent_act_ratio * self.latent_act(query_t)
                 + (1 - latent_act_ratio) * query_t
             )
-            key = (
+            key_s = (
                 latent_act_ratio * self.latent_act(key_t)
                 + (1 - latent_act_ratio) * key_t
             )
-            value = (
+            value_s = (
                 latent_act_ratio * self.latent_act(value_t)
                 + (1 - latent_act_ratio) * value_t
             )
         else:
-            query = query_t
-            key = key_t
-            value = value_t
+            query_s = query_t
+            key_s = key_t
+            value_s = value_t
 
         if attn_hidden_z is not None:
-            query *= attn_hidden_z[0]
-            key *= attn_hidden_z[1]
-            value *= attn_hidden_z[2]
+            query_s *= attn_hidden_z[0]
+            key_s *= attn_hidden_z[1]
+            value_s *= attn_hidden_z[2]
 
         if self.cola_initialized:
-            query = self.wq_cola_b(query)
-            key = self.wq_cola_b(key)
-            value = self.wq_cola_b(value)
+            query_s = self.wq_cola_b(query_s)
+            key_s = self.wq_cola_b(key_s)
+            value_s = self.wq_cola_b(value_s)
 
         if self.distillation:
             distill_loss = (
-                F.mse_loss(query, query_t)
-                + F.mse_loss(key, key_t)
-                + F.mse_loss(value, value_t)
+                F.mse_loss(query_s, query_t)
+                + F.mse_loss(key_s, key_t)
+                + F.mse_loss(value_s, value_t)
             )
         else:
             distill_loss = None
+
+        if self.distill_cola_params_only:
+            query = query_t
+            key = key_t
+            value = value_t
+        else:
+            query = query_s
+            key = key_s
+            value = value_s
 
         query_padding_mask = None
         if key_padding_mask is not None:
@@ -874,21 +892,26 @@ class CoLAAttention(nn.Module):
             calib_cola_params(["out_proj"], [output_t])
 
         if latent_act_ratio > 0:
-            output = (
+            output_s = (
                 latent_act_ratio * self.latent_act(output_t)
                 + (1 - latent_act_ratio) * output_t
             )
         else:
-            output = output_t
+            output_s = output_t
 
         if attn_hidden_z is not None:
-            output *= attn_hidden_z[3]
+            output_s *= attn_hidden_z[3]
 
         if self.cola_initialized:
-            output = self.out_proj_cola_b(output)
+            output_s = self.out_proj_cola_b(output_s)
 
         if self.distillation:
-            distill_loss += F.mse_loss(output, output_t)
+            distill_loss += F.mse_loss(output_s, output_t)
+
+        if self.distill_cola_params_only:
+            output = output_t
+        else:
+            output = output_s
 
         if retain_grad:
             self.output = output
@@ -923,10 +946,11 @@ class CoLAMLP(nn.Module):
         if self.calibration:
             self.calib_states = {
                 "_".join(ks): None
-                for ks in itertools.product(
-                    ["down_proj", "up_proj"], ["sts", "stu"]
-                )
+                for ks in itertools.product(["down_proj", "up_proj"], ["sts", "stu"])
             }
+        self.distill_cola_params_only = getattr(
+            cola_module_cfg, "distill_cola_params_only", False
+        )
 
         if not self.delay_init_cola_params:
             self.cola_initialized = True
@@ -1007,42 +1031,55 @@ class CoLAMLP(nn.Module):
         up_v_t = self.up_proj(x)
 
         if latent_act_ratio > 0:
-            up_v = (
+            up_v_s = (
                 latent_act_ratio * self.latent_act(up_v_t)
                 + (1 - latent_act_ratio) * up_v_t
             )
         else:
-            up_v = up_v_t
+            up_v_s = up_v_t
 
         if intermediate_z is not None:
-            gate *= intermediate_z[0]
-            up_v *= intermediate_z[1]
+            gate_s = gate_t * intermediate_z[0]
+            up_v_s *= intermediate_z[1]
         else:
+            gate_s = gate_t
+
+        if self.cola_initialized:
+            gate_s = self.gate_proj_cola_b(gate_s)
+            up_v_s = self.up_proj_cola_b(up_v_s)
+
+        if self.distillation:
+            distill_loss = F.mse_loss(gate_s, gate_t) + F.mse_loss(up_v_s, up_v_t)
+        else:
+            distill_loss = None
+        
+        if self.distill_cola_params_only:
             gate = gate_t
-
-        if not self.cola_initialized:
-            gate = self.gate_proj_cola_b(gate)
-            up_v = self.up_proj_cola_b(up_v)
-
+            up_v = up_v_t
+        else:
+            gate = gate_s
+            up_v = up_v_s
+        
         if retain_grad:
             self.up_v = up_v
             if self.up_v.requires_grad:
                 self.up_v.retain_grad()
+
         down_v_t = self.down_proj(gate * up_v)
 
         if latent_act_ratio > 0:
-            down_v = (
+            down_v_s = (
                 latent_act_ratio * self.latent_act(down_v_t)
                 + (1 - latent_act_ratio) * down_v_t
             )
         else:
-            down_v = down_v_t
+            down_v_s = down_v_t
 
         if mlp_hidden_z is not None:
-            down_v *= mlp_hidden_z
+            down_v_s *= mlp_hidden_z
 
-        if not self.cola_initialized:
-            down_v = self.down_proj_cola_b(down_v)
+        if self.cola_initialized:
+            down_v_s = self.down_proj_cola_b(down_v_s)
 
         if self.calibration:
 
@@ -1051,26 +1088,24 @@ class CoLAMLP(nn.Module):
                     for k, u in zip(modules, tensors):
                         u = u.view(-1, u.shape[-1])
                         s = self.latent_act(u)
-                        sts = torch.matmul(s.t(), s).cpu()
-                        stu = torch.matmul(s.t(), u).cpu()
+                        sts = torch.matmul(s.t(), s)
+                        stu = torch.matmul(s.t(), u)
                         for n, r in zip([k + "_sts", k + "_stu"], [sts, stu]):
                             if self.calib_states[n] is None:
-                                self.calib_states[n] = r
+                                self.calib_states[n] = r.cpu()
                             else:
-                                self.calib_states[n] += r
-            
+                                self.calib_states[n] += r.cpu()
+
             calib_cola_params(["up_proj", "down_proj"], [up_v_t, down_v_t])
 
-
         if self.distillation:
-            distill_loss = (
-                F.mse_loss(gate, gate_t)
-                + F.mse_loss(up_v, up_v_t)
-                + F.mse_loss(down_v, down_v_t)
-            )
-        else:
-            distill_loss = None
+            distill_loss += F.mse_loss(down_v_s, down_v_t)
 
+        if self.distill_cola_params_only:
+            down_v = down_v_t
+        else:
+            down_v = down_v_s
+        
         if retain_grad:
             self.output = down_v
             if self.output.requires_grad:

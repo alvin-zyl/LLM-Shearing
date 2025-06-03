@@ -79,6 +79,7 @@ from llmshearing.datasets.load_text_dataloader import build_text_dataloader
 from llmshearing.models.model_registry import COMPOSER_MODEL_REGISTRY
 from state import State
 
+
 def console_print(msg):
     if not dist.get_rank():
         print(msg)
@@ -103,7 +104,9 @@ def build_composer_model(cfg: DictConfig):
 def load_weights(cfg: DictConfig):
     """load weights"""
     if cfg.model.get("path", None):
-        state_dict = torch.load(cfg.model.path, mmap=True)  # for loading pre-trained llama
+        state_dict = torch.load(
+            cfg.model.path, mmap=True
+        )  # for loading pre-trained llama
         if "state" in state_dict:
             state_dict = state_dict["state"]["model"]
         console_print(f"Loaded model from path: {cfg.model.path}")
@@ -123,6 +126,8 @@ def build_optimizer(
     name: str,
     optimizer_config: Dict[str, Any],
     cola_params_only: bool = False,
+    exclude_aux_params: bool = False,
+    calibration: bool = False,
 ) -> Optimizer:
     """
     build optimizer that consists of three groups of parameters:
@@ -131,52 +136,46 @@ def build_optimizer(
     - lagrange_params: parameters of the lagrange multipliers
     """
     param_groups = {}
-    cola_model_params = [p for n, p in model.named_parameters() if "cola_b" in n]
-    aux_model_params = [
-        p for n, p in model.named_parameters() if "ln" in n or "wte" in n
-    ]
-    main_model_params = [p for n, p in model.named_parameters() if "l0_module" not in n]
-    l0_module_params = [
-        p for n, p in model.named_parameters() if "l0_module" in n and "lambda" not in n
-    ]
-    lagrange_params = [
-        p for n, p in model.named_parameters() if "l0_module" in n and "lambda" in n
-    ]
 
-    if cola_model_params and cola_params_only:
-        console_print("Only training added CoLA parameters")
-        aux_model_params_names = [
-            n for n, p in model.named_parameters() if "ln" in n or "wte" in n
-        ]
-        main_model_params_names = [
-            n for n, p in model.named_parameters() if "l0_module" not in n
-        ]
-        for n, p in model.named_parameters():
-            if (
-                n in main_model_params_names
-                and n not in aux_model_params_names
-                and "cola_b" not in n
-            ):
-                p.requires_grad_(False)
-
-    param_groups = [
-        {
-            "params": (
-                main_model_params
-                if (not cola_model_params or not cola_params_only)
-                else cola_model_params + aux_model_params
-            ),
-            "lr": optimizer_config.lr,
-        }
-    ]
-    lag_lr = pop_config(optimizer_config, "lag_lr")
-    if len(l0_module_params) > 0:
-        param_groups.extend(
-            [
-                {"params": l0_module_params, "lr": lag_lr},
-                {"params": lagrange_params, "lr": -(lag_lr)},
-            ]
+    if not calibration:
+        cola_model_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+        aux_model_params = (
+            [p for n, p in model.named_parameters() if "ln" in n or "wte" in n]
+            if not exclude_aux_params
+            else []
         )
+        main_model_params = [
+            p for n, p in model.named_parameters() if "l0_module" not in n
+        ]
+        l0_module_params = [
+            p
+            for n, p in model.named_parameters()
+            if "l0_module" in n and "lambda" not in n
+        ]
+        lagrange_params = [
+            p for n, p in model.named_parameters() if "l0_module" in n and "lambda" in n
+        ]
+
+        param_groups = [
+            {
+                "params": (
+                    main_model_params
+                    if (not cola_model_params or not cola_params_only)
+                    else cola_model_params + aux_model_params
+                ),
+                "lr": optimizer_config.lr,
+            }
+        ]
+        if len(l0_module_params) > 0:
+            lag_lr = pop_config(optimizer_config, "lag_lr")
+            param_groups.extend(
+                [
+                    {"params": l0_module_params, "lr": lag_lr},
+                    {"params": lagrange_params, "lr": -(lag_lr)},
+                ]
+            )
+    else:
+        param_groups = [{"params": [], "lr": optimizer_config.lr}]
 
     for i, group in enumerate(param_groups):
         console_print(
@@ -275,7 +274,8 @@ def main(cfg):
         cfg.model.set_names = cfg.callbacks.data_loading.set_names
     model = build_composer_model(cfg.model)
     console_print(model)
-    console_print(cfg.model.l0_module)
+    if hasattr(cfg.model, "l0_module"):
+        console_print(cfg.model.l0_module)
     console_print("Initialized model")
 
     console_print("Loading state dicts")
@@ -328,6 +328,10 @@ def main(cfg):
         cfg.optimizer.pop("name"),
         cfg.optimizer,
         getattr(cfg, "cola_params_only", False),
+        getattr(
+            getattr(cfg.model, "cola_module", None), "distill_cola_params_only", False
+        ),
+        getattr(getattr(cfg.model, "cola_module", None), "calibration", False),
     )
 
     if fsdp_config is None:
