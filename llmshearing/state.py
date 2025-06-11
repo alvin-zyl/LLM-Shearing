@@ -521,6 +521,7 @@ class State(Serializable):
         self.set_dataloader(dataloader, dataloader_label, dataloader_len)
         self.dataset_state = dataset_state
         self.dataset_resumption = dataset_resumption or {}
+        self.start_from = Time(0, TimeUnit.BATCH)
         self._max_duration = None
         self.max_duration = max_duration
         self.save_metrics = save_metrics
@@ -1441,7 +1442,8 @@ class State(Serializable):
                 serialized_value = dict(serialized_value)
 
             if attribute_name == "dataset_state":
-                self._load_dataset_state(serialized_value)
+                continue
+                # self._load_dataset_state(serialized_value)
             elif attribute_name == "optimizers":
                 self.load_optim_state(state)
             elif attribute_name == "train_metrics":
