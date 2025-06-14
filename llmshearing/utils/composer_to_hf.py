@@ -17,45 +17,95 @@ from llmshearing.models.composer_llama import LlamaAttention as la1
 
 
 def get_key_map_from_hf_to_composer(num_layers):
-    """ get the keymap from hf to composer """
+    """get the keymap from hf to composer"""
     key_map = {}
-    key_map.update({"model.embed_tokens.weight": "model.transformer.wte.weight",
-                    "model.norm.weight": "model.transformer.ln_f.weight",
-                    "lm_head.weight": "model.transformer.output.weight",
-                    "lm_head.bias": "model.transformer.output.bias"})
+    key_map.update(
+        {
+            "model.embed_tokens.weight": "model.transformer.wte.weight",
+            "model.norm.weight": "model.transformer.ln_f.weight",
+            "lm_head.weight": "model.transformer.output.weight",
+            "lm_head.bias": "model.transformer.output.bias",
+        }
+    )
     for i in range(num_layers):
-        key_map.update({f"model.layers.{i}.self_attn.q_proj.weight": f"model.transformer.blocks.{i}.attn.wq.weight",
-                        f"model.layers.{i}.self_attn.k_proj.weight": f"model.transformer.blocks.{i}.attn.wk.weight",
-                        f"model.layers.{i}.self_attn.v_proj.weight": f"model.transformer.blocks.{i}.attn.wv.weight",
-                        f"model.layers.{i}.self_attn.o_proj.weight": f"model.transformer.blocks.{i}.attn.out_proj.weight",
-                        f"model.layers.{i}.input_layernorm.weight": f"model.transformer.blocks.{i}.ln_1.weight",
-                        f"model.layers.{i}.mlp.gate_proj.weight": f"model.transformer.blocks.{i}.mlp.gate_proj.weight",
-                        f"model.layers.{i}.mlp.down_proj.weight": f"model.transformer.blocks.{i}.mlp.down_proj.weight",
-                        f"model.layers.{i}.mlp.up_proj.weight": f"model.transformer.blocks.{i}.mlp.up_proj.weight",
-                        f"model.layers.{i}.post_attention_layernorm.weight": f"model.transformer.blocks.{i}.ln_2.weight",})
+        key_map.update(
+            {
+                f"model.layers.{i}.self_attn.q_proj.weight": f"model.transformer.blocks.{i}.attn.wq.weight",
+                f"model.layers.{i}.self_attn.k_proj.weight": f"model.transformer.blocks.{i}.attn.wk.weight",
+                f"model.layers.{i}.self_attn.v_proj.weight": f"model.transformer.blocks.{i}.attn.wv.weight",
+                f"model.layers.{i}.self_attn.o_proj.weight": f"model.transformer.blocks.{i}.attn.out_proj.weight",
+                f"model.layers.{i}.input_layernorm.weight": f"model.transformer.blocks.{i}.ln_1.weight",
+                f"model.layers.{i}.mlp.gate_proj.weight": f"model.transformer.blocks.{i}.mlp.gate_proj.weight",
+                f"model.layers.{i}.mlp.down_proj.weight": f"model.transformer.blocks.{i}.mlp.down_proj.weight",
+                f"model.layers.{i}.mlp.up_proj.weight": f"model.transformer.blocks.{i}.mlp.up_proj.weight",
+                f"model.layers.{i}.post_attention_layernorm.weight": f"model.transformer.blocks.{i}.ln_2.weight",
+            }
+        )
     return key_map
 
+
+def get_key_map_from_svdllm_to_composer(num_layers):
+    """get the keymap from hf to composer"""
+    key_map = {}
+    key_map.update(
+        {
+            "model.embed_tokens.weight": "model.transformer.wte.weight",
+            "model.norm.weight": "model.transformer.ln_f.weight",
+            "lm_head.weight": "model.transformer.output.weight",
+            "lm_head.bias": "model.transformer.output.bias",
+        }
+    )
+    for i in range(num_layers):
+        key_map.update(
+            {
+                f"model.layers.{i}.self_attn.q_u_proj.weight": f"model.transformer.blocks.{i}.attn.wq_cola_b.weight",
+                f"model.layers.{i}.self_attn.q_v_proj.weight": f"model.transformer.blocks.{i}.attn.wq_cola_a.weight",
+                f"model.layers.{i}.self_attn.k_u_proj.weight": f"model.transformer.blocks.{i}.attn.wk_cola_b.weight",
+                f"model.layers.{i}.self_attn.k_v_proj.weight": f"model.transformer.blocks.{i}.attn.wk_cola_a.weight",
+                f"model.layers.{i}.self_attn.v_u_proj.weight": f"model.transformer.blocks.{i}.attn.wv_cola_b.weight",
+                f"model.layers.{i}.self_attn.v_v_proj.weight": f"model.transformer.blocks.{i}.attn.wv_cola_a.weight",
+                f"model.layers.{i}.self_attn.o_u_proj.weight": f"model.transformer.blocks.{i}.attn.out_proj_cola_b.weight",
+                f"model.layers.{i}.self_attn.o_v_proj.weight": f"model.transformer.blocks.{i}.attn.out_proj_cola_a.weight",
+                f"model.layers.{i}.input_layernorm.weight": f"model.transformer.blocks.{i}.ln_1.weight",
+                f"model.layers.{i}.mlp.gate_u_proj.weight": f"model.transformer.blocks.{i}.mlp.gate_proj_cola_b.weight",
+                f"model.layers.{i}.mlp.gate_v_proj.weight": f"model.transformer.blocks.{i}.mlp.gate_proj_cola_a.weight",
+                f"model.layers.{i}.mlp.down_u_proj.weight": f"model.transformer.blocks.{i}.mlp.down_proj_cola_b.weight",
+                f"model.layers.{i}.mlp.down_v_proj.weight": f"model.transformer.blocks.{i}.mlp.down_proj_cola_a.weight",
+                f"model.layers.{i}.mlp.up_u_proj.weight": f"model.transformer.blocks.{i}.mlp.up_proj_cola_b.weight",
+                f"model.layers.{i}.mlp.up_v_proj.weight": f"model.transformer.blocks.{i}.mlp.up_proj_cola_a.weight",
+                f"model.layers.{i}.post_attention_layernorm.weight": f"model.transformer.blocks.{i}.ln_2.weight",
+            }
+        )
+    return key_map
+
+
 def get_key_map_from_composer_to_hf(num_layers):
-    """ get kepmap from composer to hf """
-    return {value: key for key, value in get_key_map_from_hf_to_composer(num_layers).items()}
+    """get kepmap from composer to hf"""
+    return {
+        value: key for key, value in get_key_map_from_hf_to_composer(num_layers).items()
+    }
+
 
 def get_layer_num_from_weights(weights):
-    """ get the layer num from weights name, works for both hf and composer weights """
+    """get the layer num from weights name, works for both hf and composer weights"""
     max_layer_i = 0
     keyword = ["layers.", "blocks."]
     for key in weights:
         for key_word in keyword:
             if key_word in key:
-                current_i = int(key[key.index(key_word) + len(key_word):].split(".")[0])
+                current_i = int(
+                    key[key.index(key_word) + len(key_word) :].split(".")[0]
+                )
                 if current_i > max_layer_i:
                     max_layer_i = current_i
     return max_layer_i + 1
-    
+
+
 def save_hf_to_composer(hf_model_name_or_path, output_path):
-    """ Convert composer model to huggingface model """ 
+    """Convert composer model to huggingface model"""
     model = AutoModelForCausalLM.from_pretrained(hf_model_name_or_path)
     hf_weights = model.state_dict()
-    
+
     n_layers = get_layer_num_from_weights(hf_weights)
     key_map = get_key_map_from_hf_to_composer(n_layers)
     composer_state_dict = {}
@@ -68,23 +118,41 @@ def save_hf_to_composer(hf_model_name_or_path, output_path):
     torch.save(composer_state_dict, output_path)
     print(f"saved composer model to {output_path}")
 
+
+def save_svdllm_to_composer(svdllm_model_path, output_path):
+    state_dict = torch.load(svdllm_model_path, weights_only=False, map_location="cpu")
+    n_layers = get_layer_num_from_weights(state_dict)
+    key_map = get_key_map_from_svdllm_to_composer(n_layers)
+    composer_state_dict = {}
+    for key in state_dict:
+        if key in key_map:
+            composer_state_dict[key_map[key]] = (
+                state_dict[key].t() if "cola" in key_map[key] else state_dict[key]
+            )
+        else:
+            # rotary will be ignored
+            print(f"key {key} not found in keymap")
+    torch.save(composer_state_dict, output_path)
+    print(f"saved composer model to {output_path}")
+
+
 def construct_hf_config(model_config: om = None):
     assert model_config is not None, "model config is None"
     model_class = model_config.pop("model_class")
-    
+
     if model_class == "LlamaForCausalLM":
         hf_model_name = "meta-llama/Llama-2-7b-hf"
         tokenzier_name = "meta-llama/Llama-2-7b-hf"
         config = AutoConfig.from_pretrained(hf_model_name)
-        
+
     for key in model_config:
         setattr(config, key, model_config[key])
-    
-    return config, tokenzier_name 
-            
-        
-def save_composer_to_hf(composer_model_path, output_path=None, model_config:om = None):
-    """ convert composer ckpt's weights to huggingface """
+
+    return config, tokenzier_name
+
+
+def save_composer_to_hf(composer_model_path, output_path=None, model_config: om = None):
+    """convert composer ckpt's weights to huggingface"""
 
     weights = torch.load(composer_model_path)
     if "state" in weights:
@@ -98,12 +166,13 @@ def save_composer_to_hf(composer_model_path, output_path=None, model_config:om =
     model.load_state_dict(hf_weights, strict=False)
     model = model.bfloat16()
     model.save_pretrained(output_path, dtype=torch.float16)
-    
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_nanme)
     tokenizer.save_pretrained(output_path)
-    
+
     print(f"saved hf model to {output_path}")
-   
+
+
 if __name__ == "__main__":
     func = sys.argv[1]
     other_cli_args = sys.argv[2:]
@@ -113,5 +182,7 @@ if __name__ == "__main__":
         composer_model_path, output_path, *other_args = sys.argv[2:]
         cli_cfg = om.from_cli(other_args)
         save_composer_to_hf(composer_model_path, output_path, cli_cfg)
+    elif func == "save_svdllm_to_composer":
+        save_svdllm_to_composer(*other_cli_args)
     else:
         raise ValueError(f"func {func} not found")

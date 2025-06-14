@@ -150,7 +150,7 @@ def build_optimizer(
     param_groups = {}
 
     if not calibration:
-        cola_model_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+        cola_model_params = [p for n, p in model.named_parameters() if "cola" in n]
         aux_model_params = (
             [p for n, p in model.named_parameters() if "ln" in n or "wte" in n]
             if not exclude_aux_params
@@ -290,14 +290,15 @@ def main(cfg):
         console_print(cfg.model.l0_module)
     console_print("Initialized model")
 
-    console_print("Loading state dicts")
-    state_dict = load_weights(cfg)
-    console_print("Loaded state dicts")
-    if state_dict is not None:
-        console_print("Loading weights")
-        load_state_dict(model, state_dict)
-        console_print("Loaded weights")
-    del state_dict
+    if "path" in cfg.model:
+        console_print("Loading state dicts")
+        state_dict = load_weights(cfg)
+        console_print("Loaded state dicts")
+        if state_dict is not None:
+            console_print("Loading weights")
+            load_state_dict(model, state_dict)
+            console_print("Loaded weights")
+        del state_dict
 
     if (
         "cola" in cfg.model.name
@@ -521,7 +522,7 @@ def main(cfg):
             state.train_dataloader,
         )
 
-    state.start_from = ensure_time(cfg.start_from, TimeUnit.BATCH)
+    state.start_from = ensure_time(getattr(cfg, "start_from", 0), TimeUnit.BATCH)
     state.max_duration = ensure_time(cfg.max_duration, TimeUnit.EPOCH)
     state.schedulers = compile_schedulers(schedulers, state, 1.0)
     scheduler_step_frequency = TimeUnit.BATCH

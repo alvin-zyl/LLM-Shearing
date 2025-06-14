@@ -23,13 +23,42 @@ from transformers.activations import ACT2FN
 
 
 class CoLAUpProjLayer(nn.Module):
-    def __init__(self, d_features):
+    def __init__(self, d_features, rank=None):
         super().__init__()
         self.d_features = d_features
-        self.weight = nn.Parameter(torch.diag(torch.ones(d_features)))
+        self.rank = rank
+        if rank is None or rank == d_features:
+            self.weight = nn.Parameter(torch.diag(torch.ones(d_features)))
+        else:
+            self.weight = nn.Parameter(
+                nn.init.kaiming_normal_(torch.empty(rank, d_features))
+            )
 
     def forward(self, x):
         return torch.matmul(x, self.weight)
+    
+    def __repr__(self):
+        return f"CoLAUpProjLayer(d_features={self.d_features}, rank={self.rank})"
+
+
+class CoLADownProjLayer(nn.Module):
+    def __init__(self, d_features, rank=None):
+        super().__init__()
+        self.d_features = d_features
+        self.rank = rank
+        if rank is None or rank == d_features:
+            self.weight = nn.Parameter(torch.diag(torch.ones(d_features)))
+        else:
+            self.weight = nn.Parameter(
+                nn.init.kaiming_normal_(torch.empty(d_features, rank))
+            )
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight)
+
+    def __repr__(self):
+        return f"CoLADownProjLayer(d_features={self.d_features}, rank={self.rank})"
+
 
 
 class LlamaRMSNorm(nn.Module):
@@ -585,30 +614,42 @@ class CoLAAttention(nn.Module):
             cola_module_cfg, "distill_cola_params_only", False
         )
 
-        # self.Wqkv = nn.Linear(self.d_model, 3 * self.d_model, device=device, bias=False)
-        # for param init fn; enables shape based init of fused layers
-        # fuse_splits = (cfg.d_model, 2 * cfg.d_model)
-        # self.Wqkv._fused = (0, fuse_splits)  # type: ignore
-        self.wq = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
-        self.wk = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
-        self.wv = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
-
-        self.attn_fn = flash_attn_fn if self.attn_impl == "flash" else normal_attn_fn
-
-        self.out_proj = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
-        self.out_proj._is_residual = True  # type: ignore
-
+        self.model_type = getattr(cola_module_cfg, "model_type", "hybrid")
+        self.rank = getattr(cola_module_cfg, "attn_rank", self.d_model)
         self.delay_init_cola_params = getattr(
             cola_module_cfg, "delay_init_cola_params", False
         )
-        if not self.delay_init_cola_params:
-            self.cola_initialized = True
-            self.wq_cola_b = CoLAUpProjLayer(self.d_model)
-            self.wk_cola_b = CoLAUpProjLayer(self.d_model)
-            self.wv_cola_b = CoLAUpProjLayer(self.d_model)
-            self.out_proj_cola_b = CoLAUpProjLayer(self.d_model)
+
+        if self.model_type == "hybrid" or self.distillation:
+            self.wq = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
+            self.wk = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
+            self.wv = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
+            self.out_proj = nn.Linear(
+                self.d_model, self.d_model, device=device, bias=False
+            )
+            self.out_proj._is_residual = True  # type: ignore
+
+        if self.model_type == "cola" and not self.delay_init_cola_params:
+            self.cola_a_initialized = True
+            self.wq_cola_a = CoLADownProjLayer(self.d_model, self.rank)
+            self.wk_cola_a = CoLADownProjLayer(self.d_model, self.rank)
+            self.wv_cola_a = CoLADownProjLayer(self.d_model, self.rank)
+            self.out_proj_cola_a = CoLADownProjLayer(self.d_model, self.rank)
         else:
-            self.cola_initialized = False
+            self.cola_a_initialized = False
+
+        self.attn_fn = flash_attn_fn if self.attn_impl == "flash" else normal_attn_fn
+
+        if (
+            self.model_type == "hybrid" or self.model_type == "cola"
+        ) and not self.delay_init_cola_params:
+            self.cola_b_initialized = True
+            self.wq_cola_b = CoLAUpProjLayer(self.d_model, self.rank)
+            self.wk_cola_b = CoLAUpProjLayer(self.d_model, self.rank)
+            self.wv_cola_b = CoLAUpProjLayer(self.d_model, self.rank)
+            self.out_proj_cola_b = CoLAUpProjLayer(self.d_model, self.rank)
+        else:
+            self.cola_b_initialized = False
 
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim)
 
@@ -757,12 +798,30 @@ class CoLAAttention(nn.Module):
 
         # qkv = self.Wqkv(x)
         # query, key, value = qkv.chunk(3, dim=2)
-        if self.wq is None:
-            return None, None, past_key_value
+        # if self.wq is None:
+        #     return None, None, past_key_value
 
-        query_t = self.wq(x)
-        key_t = self.wk(x)
-        value_t = self.wv(x)
+        if self.cola_a_initialized and not self.distillation:
+            query_t = self.wq_cola_a(x)
+            key_t = self.wk_cola_a(x)
+            value_t = self.wv_cola_a(x)
+
+            query_s = query_t
+            key_s = key_t
+            value_s = value_t
+        else:
+            query_t = self.wq(x)
+            key_t = self.wk(x)
+            value_t = self.wv(x)
+
+            if self.cola_a_initialized:
+                query_s = self.wq_cola_a(x)
+                key_s = self.wk_cola_a(x)
+                value_s = self.wv_cola_a(x)
+            else:
+                query_s = query_t
+                key_s = key_t
+                value_s = value_t
 
         if self.calibration:
 
@@ -783,31 +842,27 @@ class CoLAAttention(nn.Module):
 
         if latent_act_ratio > 0:
             query_s = (
-                latent_act_ratio * self.latent_act(query_t)
-                + (1 - latent_act_ratio) * query_t
+                latent_act_ratio * self.latent_act(query_s)
+                + (1 - latent_act_ratio) * query_s
             )
             key_s = (
-                latent_act_ratio * self.latent_act(key_t)
-                + (1 - latent_act_ratio) * key_t
+                latent_act_ratio * self.latent_act(key_s)
+                + (1 - latent_act_ratio) * key_s
             )
             value_s = (
-                latent_act_ratio * self.latent_act(value_t)
-                + (1 - latent_act_ratio) * value_t
+                latent_act_ratio * self.latent_act(value_s)
+                + (1 - latent_act_ratio) * value_s
             )
-        else:
-            query_s = query_t
-            key_s = key_t
-            value_s = value_t
 
         if attn_hidden_z is not None:
             query_s *= attn_hidden_z[0]
             key_s *= attn_hidden_z[1]
             value_s *= attn_hidden_z[2]
 
-        if self.cola_initialized:
+        if self.cola_b_initialized:
             query_s = self.wq_cola_b(query_s)
-            key_s = self.wq_cola_b(key_s)
-            value_s = self.wq_cola_b(value_s)
+            key_s = self.wk_cola_b(key_s)
+            value_s = self.wv_cola_b(value_s)
 
         if self.distillation:
             distill_loss = (
@@ -818,7 +873,7 @@ class CoLAAttention(nn.Module):
         else:
             distill_loss = None
 
-        if self.distill_cola_params_only and self.training:
+        if self.distillation and self.distill_cola_params_only and self.training:
             query = query_t
             key = key_t
             value = value_t
@@ -886,29 +941,35 @@ class CoLAAttention(nn.Module):
             if self.context.requires_grad:
                 self.context.retain_grad()
 
-        output_t = self.out_proj(context)
+        if self.cola_a_initialized and not self.distillation:
+            output_t = self.out_proj_cola_a(context)
+            output_s = output_t
+        else:
+            output_t = self.out_proj(context)
+            if self.cola_a_initialized:
+                output_s = self.out_proj_cola_a(context)
+            else:
+                output_s = output_t
 
         if self.calibration:
             calib_cola_params(["out_proj"], [output_t])
 
         if latent_act_ratio > 0:
             output_s = (
-                latent_act_ratio * self.latent_act(output_t)
-                + (1 - latent_act_ratio) * output_t
+                latent_act_ratio * self.latent_act(output_s)
+                + (1 - latent_act_ratio) * output_s
             )
-        else:
-            output_s = output_t
 
         if attn_hidden_z is not None:
             output_s *= attn_hidden_z[3]
 
-        if self.cola_initialized:
+        if self.cola_b_initialized:
             output_s = self.out_proj_cola_b(output_s)
 
         if self.distillation:
             distill_loss += F.mse_loss(output_s, output_t)
 
-        if self.distill_cola_params_only and self.training:
+        if self.distillation and self.distill_cola_params_only and self.training:
             output = output_t
         else:
             output = output_s
@@ -925,17 +986,6 @@ class CoLAMLP(nn.Module):
     def __init__(self, cfg: DictConfig, device: Optional[str] = None):
         super().__init__()
         self.cfg = cfg
-        self.gate_proj = nn.Linear(
-            cfg.d_model, cfg.intermediate_size, bias=False, device=device
-        )
-        self.down_proj = nn.Linear(
-            cfg.intermediate_size, cfg.d_model, bias=False, device=device
-        )
-        self.up_proj = nn.Linear(
-            cfg.d_model, cfg.intermediate_size, bias=False, device=device
-        )
-        self.down_proj._is_residule = True  # type: ignore
-
         cola_module_cfg = cfg.cola_module
         self.latent_act = ACT2FN[cola_module_cfg.latent_act_type]
         self.distillation = getattr(cola_module_cfg, "distillation", False)
@@ -951,14 +1001,42 @@ class CoLAMLP(nn.Module):
         self.distill_cola_params_only = getattr(
             cola_module_cfg, "distill_cola_params_only", False
         )
+        self.keep_full_rank_act = getattr(
+            cola_module_cfg, "keep_full_rank_act", False
+        )
 
-        if not self.delay_init_cola_params:
-            self.cola_initialized = True
-            self.gate_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
-            self.up_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size)
-            self.down_proj_cola_b = CoLAUpProjLayer(cfg.d_model)
+        self.model_type = getattr(cola_module_cfg, "model_type", "hybrid")
+        self.rank = getattr(cola_module_cfg, "mlp_rank", None)
+
+        if self.model_type == "hybrid" or self.distillation:
+            self.gate_proj = nn.Linear(
+                cfg.d_model, cfg.intermediate_size, bias=False, device=device
+            )
+            self.down_proj = nn.Linear(
+                cfg.intermediate_size, cfg.d_model, bias=False, device=device
+            )
+            self.up_proj = nn.Linear(
+                cfg.d_model, cfg.intermediate_size, bias=False, device=device
+            )
+            self.down_proj._is_residual = True  # type: ignore
+
+        if self.model_type == "cola" and not self.delay_init_cola_params:
+            self.cola_a_initialized = True
+            self.gate_proj_cola_a = CoLADownProjLayer(cfg.d_model, self.rank)
+            self.up_proj_cola_a = CoLADownProjLayer(cfg.d_model, self.rank)
+            self.down_proj_cola_a = CoLADownProjLayer(cfg.intermediate_size, self.rank)
         else:
-            self.cola_initialized = False
+            self.cola_a_initialized = False
+
+        if (
+            self.model_type == "hybrid" or self.model_type == "cola"
+        ) and not self.delay_init_cola_params:
+            self.cola_b_initialized = True
+            self.gate_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size, self.rank)
+            self.up_proj_cola_b = CoLAUpProjLayer(cfg.intermediate_size, self.rank)
+            self.down_proj_cola_b = CoLAUpProjLayer(cfg.d_model, self.rank)
+        else:
+            self.cola_b_initialized = False
 
     def prune_params(self, zs_block):
         intermediate_z = zs_block.get("intermediate_z", None)
@@ -1025,60 +1103,85 @@ class CoLAMLP(nn.Module):
         intermediate_z=None,
         mlp_hidden_z=None,
     ):
-        if self.up_proj is None:
-            return None
-        gate_t = F.silu(self.gate_proj(x))
-        up_v_t = self.up_proj(x)
+        if self.cola_a_initialized and not self.distillation:
+            gate_t = gate_s = self.gate_proj_cola_a(x)
+            up_v_t = up_v_s = self.up_proj_cola_a(x)
+
+        else:
+            gate_t_pre_act = self.gate_proj(x)
+            gate_t = F.silu(gate_t_pre_act)
+            up_v_t = self.up_proj(x)
+
+            if self.cola_a_initialized:
+                gate_s = self.gate_proj_cola_a(x)
+                up_v_s = self.up_proj_cola_a(x)
+            else:
+                gate_s = gate_t
+                up_v_s = up_v_t
 
         if latent_act_ratio > 0:
             up_v_s = (
-                latent_act_ratio * self.latent_act(up_v_t)
-                + (1 - latent_act_ratio) * up_v_t
+                latent_act_ratio * self.latent_act(up_v_s)
+                + (1 - latent_act_ratio) * up_v_s
             )
-        else:
-            up_v_s = up_v_t
+            if self.cola_a_initialized:
+                gate_s = (
+                    latent_act_ratio * self.latent_act(gate_s)
+                    + (1 - latent_act_ratio) * gate_s
+                )
 
         if intermediate_z is not None:
-            gate_s = gate_t * intermediate_z[0]
+            gate_s *= intermediate_z[0]
             up_v_s *= intermediate_z[1]
-        else:
-            gate_s = gate_t
 
-        if self.cola_initialized:
+        if self.cola_b_initialized:
             gate_s = self.gate_proj_cola_b(gate_s)
             up_v_s = self.up_proj_cola_b(up_v_s)
 
         if self.distillation:
-            distill_loss = F.mse_loss(gate_s, gate_t) + F.mse_loss(up_v_s, up_v_t)
+            distill_loss = F.mse_loss(up_v_s, up_v_t)
+            if self.cola_a_initialized:
+                distill_loss += F.mse_loss(gate_s, gate_t if not self.keep_full_rank_act else gate_t_pre_act)
         else:
             distill_loss = None
-        
-        if self.distill_cola_params_only and self.training:
+
+        if self.cola_a_initialized and self.keep_full_rank_act:
+            gate_s = F.silu(gate_s)
+
+        if self.distillation and self.distill_cola_params_only and self.training:
             gate = gate_t
             up_v = up_v_t
         else:
             gate = gate_s
             up_v = up_v_s
-        
+
         if retain_grad:
             self.up_v = up_v
             if self.up_v.requires_grad:
                 self.up_v.retain_grad()
 
-        down_v_t = self.down_proj(gate * up_v)
+        if self.cola_a_initialized and not self.distillation:
+            down_v_t = self.down_proj_cola_a(gate * up_v)
+            down_v_s = down_v_t
+        else:
+            down_in = gate * up_v
+            down_v_t = self.down_proj(down_in)
+
+            if self.cola_a_initialized:
+                down_v_s = self.down_proj_cola_a(down_in)
+            else:
+                down_v_s = down_v_t
 
         if latent_act_ratio > 0:
             down_v_s = (
-                latent_act_ratio * self.latent_act(down_v_t)
-                + (1 - latent_act_ratio) * down_v_t
+                latent_act_ratio * self.latent_act(down_v_s)
+                + (1 - latent_act_ratio) * down_v_s
             )
-        else:
-            down_v_s = down_v_t
 
         if mlp_hidden_z is not None:
             down_v_s *= mlp_hidden_z
 
-        if self.cola_initialized:
+        if self.cola_b_initialized:
             down_v_s = self.down_proj_cola_b(down_v_s)
 
         if self.calibration:
@@ -1101,11 +1204,11 @@ class CoLAMLP(nn.Module):
         if self.distillation:
             distill_loss += F.mse_loss(down_v_s, down_v_t)
 
-        if self.distill_cola_params_only and self.training:
+        if self.distillation and self.distill_cola_params_only and self.training:
             down_v = down_v_t
         else:
             down_v = down_v_s
-        
+
         if retain_grad:
             self.output = down_v
             if self.output.requires_grad:
