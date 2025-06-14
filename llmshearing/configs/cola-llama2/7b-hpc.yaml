@@ -36,8 +36,9 @@ model:
       mlp_hidden_size: 2048
   cola_module:
     latent_act_type: silu
-    latent_act_warmup_steps: 640ba
-    distillation: true
+    latent_act_schedule: constant
+    latent_act_ratio: 1.0
+    distillation: false
 
 # Tokenizer
 tokenizer:
@@ -115,6 +116,7 @@ fsdp_config:
   activation_cpu_offload: false
   verbose: false
   state_dict_type: sharded
+  use_orig_params: true
 
 # Logging
 progress_bar: false
@@ -140,6 +142,7 @@ loggers:
     entity: ziyueliu
     init_kwargs:
       dir: wandb_dir
+      # mode: offline
 
 # Checkpoint to local filesystem or remote object store
 save_interval: 800ba 

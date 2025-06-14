@@ -7,19 +7,33 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 
+for file in /dev/shm/*; do
+   if [ -e "$file" ]; then
+       echo "Removing $file..."
+       rm "$file"
+   fi
+done
+
 PROJ_DIR=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing
 LAUNCH_SCRIPT=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/scripts/launch.sh
 DATA_DIR=/pscratch/sd/a/alvinliu/datasets/shearllm/for_prune
 OUTPUT_DIR=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
 TRAIN_SCRIPT=${PROJ_DIR}/llmshearing/train.py
-MODEL_PATH=${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer
+MODEL_PATH=${MODEL_PATH:-"$PROJ_DIR/llmshearing/models/Llama-2-7b-composer/state_dict.pt"}
+RESULTS_PATH=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
+COLA_PATH=${COLA_PATH:-"$RESULTS_PATH/cola_llama2_7b_distill_only_constant_sl4096/ep0-ba3200_cola_params.pt"}
+
+if [ "${COLA_PATH}" != "none"]; then
+    readonly cola_path_flag="model.cola_module.path=$COLA_PATH"
+else
+    readonly cola_path_flag=""
+fi
 
 # Specify $PROJ_DIR in scripts/launch.sh and scripts/srun_launch.sh if using slurm
 
 from_model=7b # source model size
 to_model=4.8b # target model size
-config_file=${PROJ_DIR}/llmshearing/configs/cola-llama2/${from_model}.yaml
-path=$MODEL_PATH/state_dict.pt
+config_file=${PROJ_DIR}/llmshearing/configs/cola-llama2/${from_model}-hpc.yaml
 
 # data setup
 data_local=${DATA_DIR}
@@ -33,10 +47,21 @@ global_train_batch_size=$TBZ
 device_eval_batch_size=8
 
 # learning setup
-lr=1e-4 # learning rate for the main parameters
-max_duration=3200ba # 0.42B tokens
-save_interval=1000ba # save in the end
-t_warmup=320ba # 10% learning rate warmup 
+LR=${LR:-"1e-4"}
+START=${START:-"0ba"}
+STEPS=${STEPS:-"3200ba"}
+SAVE_STEPS=${SAVE_STEPS:-"200ba"}
+WU=${WU:-"320ba"}
+lr=$LR # learning rate for the main parameters
+max_duration=$STEPS # 0.42B tokens
+save_interval=$SAVE_STEPS # save in the end
+t_warmup=$WU # 10% learning rate warmup 
+
+# CoLA configs
+COLA_PARAMS_ONLY=${COLA_PARAMS_ONLY:-"true"}
+LA_RATIO=${LA_RATIO:-"1.0"}
+LA_SCHED=${LA_SCHED:-"constant"}
+LA_WU=${LA_WU:-"320ba"}
 
 # dynamic loading setup
 dynamic=True
@@ -52,8 +77,9 @@ eval_interval=50ba # eval every 50 batches and update the loading proportion
 
 
 # pruning setup
+LAG_WU=${LAG_WU:-"640ba"}
 lag_lr=1.0 # learning rate or l0_module
-lagr_warmup=640ba # 20% sparsity warmup
+lagr_warmup=$LAG_WU # 20% sparsity warmup
 if [[ $to_model == 4.8b ]]; then
     target_attn_hidden_size=1536; target_cola_intermediate_size=2048; target_mlp_hidden_size=2048
 fi
@@ -98,6 +124,7 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     device_train_microbatch_size=${device_train_microbatch_size} \
     device_eval_batch_size=${device_eval_batch_size} \
     max_seq_len=${max_seq_len} \
+    start_from=${START} \
     max_duration=${max_duration} \
     eval_first=false \
     scheduler.t_warmup=${t_warmup} \
@@ -107,7 +134,12 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     save_interval=${save_interval} \
     optimizer.lr=${lr} \
     optimizer.lag_lr=${lag_lr} \
-    model.path=${path} \
+    cola_params_only=${COLA_PARAMS_ONLY} \
+    model.path=${MODEL_PATH} \
+    $cola_path_flag \
+    model.cola_module.latent_act_ratio=${LA_RATIO} \
+    model.cola_module.latent_act_schedule=${LA_SCHED} \
+    model.cola_module.latent_act_warmup_steps=${LA_WU} \
     model.l0_module.lagrangian_warmup_steps=${lagr_warmup} \
     model.l0_module.pruning_modules='[attn_hidden,intermediate,mlp_hidden]' \
     model.l0_module.eval_target_model=${eval_target_model} \

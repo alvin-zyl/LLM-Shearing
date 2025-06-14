@@ -39,10 +39,17 @@ global_train_batch_size=$TBZ
 device_eval_batch_size=8
 
 # learning setup
-lr=1e-3 # learning rate for the main parameters
-max_duration=3200ba # 0.42B tokens
-save_interval=100ba # save in the end
-t_warmup=320ba # 10% learning rate warmup 
+LR=${LR:-"1e-3"}
+STEPS=${STEPS:-"3200ba"}
+SAVE_STEPS=${SAVE_STEPS:-"100ba"}
+WU=${WU:-"320ba"}
+lr=$LR # learning rate for the main parameters
+max_duration=$STEPS # 0.42B tokens
+save_interval=$SAVE_STEPS # save in the end
+t_warmup=$WU # 10% learning rate warmup 
+
+LA_SCHED=${LA_SCHED:-"constant"}
+LA_WU=${LA_WU:-"320ba"}
 
 # dynamic loading setup
 dynamic=True
@@ -107,6 +114,8 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     save_interval=${save_interval} \
     optimizer.lr=${lr} \
     model.path=${path} \
+    model.cola_module.latent_act_schedule=${LA_SCHED} \
+    model.cola_module.latent_act_warmup_steps=${LA_WU} \
     callbacks.data_loading.dynamic=${dynamic} \
     callbacks.data_loading.set_names=${set_names} \
     callbacks.data_loading.proportion=${proportion} \

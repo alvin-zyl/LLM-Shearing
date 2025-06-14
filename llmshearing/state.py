@@ -1442,8 +1442,7 @@ class State(Serializable):
                 serialized_value = dict(serialized_value)
 
             if attribute_name == "dataset_state":
-                continue
-                # self._load_dataset_state(serialized_value)
+                self._load_dataset_state(serialized_value)
             elif attribute_name == "optimizers":
                 self.load_optim_state(state)
             elif attribute_name == "train_metrics":

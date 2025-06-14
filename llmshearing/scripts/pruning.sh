@@ -12,29 +12,35 @@ LAUNCH_SCRIPT=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/scr
 DATA_DIR=/pscratch/sd/a/alvinliu/datasets/shearllm/for_prune
 OUTPUT_DIR=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
 TRAIN_SCRIPT=${PROJ_DIR}/llmshearing/train.py
-MODEL_PATH=${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer
+MODEL_PATH=${MODEL_PATH:-"$PROJ_DIR/llmshearing/models/Llama-2-7b-composer/state_dict.pt"}
 
 # Specify $PROJ_DIR in scripts/launch.sh and scripts/srun_launch.sh if using slurm
 
 from_model=7b # source model size
 to_model=2.7b # target model size
 config_file=${PROJ_DIR}/llmshearing/configs/llama2/${from_model}.yaml
-path=$MODEL_PATH/state_dict.pt
 
 # data setup
 data_local=${DATA_DIR}
 
 # basic setup
+BZ=${BZ:-"2"}
+TBZ=${TBZ:-"32"}
 max_seq_len=4096
-device_train_microbatch_size=2
-global_train_batch_size=32
+device_train_microbatch_size=$BZ
+global_train_batch_size=$TBZ
 device_eval_batch_size=8
 
 # learning setup
-lr=1e-4 # learning rate for the main parameters
-max_duration=3200ba # 0.42B tokens
-save_interval=500ba # save in the end
-t_warmup=320ba # 10% learning rate warmup 
+LR=${LR:-"1e-4"}
+START=${START:-"0ba"}
+STEPS=${STEPS:-"3200ba"}
+SAVE_STEPS=${SAVE_STEPS:-"200ba"}
+WU=${WU:-"320ba"}
+lr=$LR # learning rate for the main parameters
+max_duration=$STEPS # 0.42B tokens
+save_interval=$SAVE_STEPS # save in the end
+t_warmup=$WU # 10% learning rate warmup 
 
 # dynamic loading setup
 dynamic=True
@@ -56,8 +62,9 @@ eval_interval=50ba # eval every 50 batches and update the loading proportion
 
 
 # pruning setup
+LAG_WU=${LAG_WU:-"640ba"}
 lag_lr=1.0 # learning rate or l0_module
-lagr_warmup=640ba # 20% sparsity warmup
+lagr_warmup=$LAG_WU # 20% sparsity warmup
 if [[ $to_model == 1.3b ]]; then
     target_d_model=2048; target_n_heads=16; target_n_layers=24; target_intermediate_size=5504
 elif [[ $to_model == 2.7b ]]; then
@@ -106,6 +113,7 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     device_train_microbatch_size=${device_train_microbatch_size} \
     device_eval_batch_size=${device_eval_batch_size} \
     max_seq_len=${max_seq_len} \
+    start_from=${START} \
     max_duration=${max_duration} \
     eval_first=false \
     scheduler.t_warmup=${t_warmup} \
@@ -115,7 +123,7 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     save_interval=${save_interval} \
     optimizer.lr=${lr} \
     optimizer.lag_lr=${lag_lr} \
-    model.path=${path} \
+    model.path=${MODEL_PATH} \
     model.l0_module.lagrangian_warmup_steps=${lagr_warmup} \
     model.l0_module.pruning_modules='[head,intermediate,hidden]' \
     model.l0_module.eval_target_model=${eval_target_model} \
