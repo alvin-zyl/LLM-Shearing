@@ -398,11 +398,15 @@ class DynamicStreamingDataset(StreamingDataset):
         # Currently only supports dynamically loading data from each domain for once. 
         # Issues could occur if one domain of data is used up. 
         while True:
-            proportion = self.proportion
-            stream_id = np.random.choice(range(self.num_streams), 1, p=proportion)[0].item()
-            domain_sample_id = sample_ids_per_stream[stream_id]
-            domain_sample_id = domain_sample_id[self.used_num_samples_per_stream[stream_id] % self.samples_per_stream[stream_id]]
-            self.used_num_samples_per_stream[stream_id] += 1
+            try:
+                proportion = self.proportion
+                stream_id = np.random.choice(range(self.num_streams), 1, p=proportion)[0].item()
+                domain_sample_id = sample_ids_per_stream[stream_id]
+                domain_sample_id = domain_sample_id[self.used_num_samples_per_stream[stream_id] % self.samples_per_stream[stream_id]]
+                self.used_num_samples_per_stream[stream_id] += 1
+            except Exception as e:
+                print(f"Data loader got exception {e}, jumping over")
+                continue
             yield self[domain_sample_id]
 
 class TextDynamicStreamingDataset(DynamicStreamingDataset):
