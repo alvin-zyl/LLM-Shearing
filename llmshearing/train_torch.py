@@ -79,6 +79,7 @@ from llmshearing.datasets.load_text_dataloader import build_text_dataloader
 from llmshearing.models.model_registry import COMPOSER_MODEL_REGISTRY
 from state import State
 
+
 def console_print(msg):
     if not dist.get_rank():
         print(msg)
@@ -140,6 +141,7 @@ def build_optimizer(
     cola_params_only: bool = False,
     exclude_aux_params: bool = False,
     calibration: bool = False,
+    distill_from_svd: bool = False,
 ) -> Optimizer:
     """
     build optimizer that consists of three groups of parameters:
@@ -150,7 +152,23 @@ def build_optimizer(
     param_groups = {}
 
     if not calibration:
-        cola_model_params = [p for n, p in model.named_parameters() if "cola" in n]
+        cola_model_params = [
+            p
+            for n, p in model.named_parameters()
+            if ("cola" if not distill_from_svd else "distill") in n
+        ]
+        if getattr(optimizer_config, "cola_b_only", False):
+            console_print("Only optimizing cola_b params")
+            optimizer_config.pop("cola_b_only")
+            cola_model_params = cola_model_params = [
+                p for n, p in model.named_parameters() if "cola_b" in n
+            ]
+        elif getattr(optimizer_config, "cola_a_only", False):
+            console_print("Only optimizing cola_a params")
+            optimizer_config.pop("cola_a_only")
+            cola_model_params = cola_model_params = [
+                p for n, p in model.named_parameters() if "cola_a" in n
+            ]
         aux_model_params = (
             [p for n, p in model.named_parameters() if "ln" in n or "wte" in n]
             if not exclude_aux_params
@@ -324,6 +342,7 @@ def main(cfg):
     ), "please specify the set (domain) names in the config"
 
     import streaming
+
     streaming.base.util.clean_stale_shared_memory()
 
     console_print("Building train loader...")
@@ -358,10 +377,9 @@ def main(cfg):
         cfg.optimizer.pop("name"),
         cfg.optimizer,
         getattr(cfg, "cola_params_only", False),
-        getattr(
-            getattr(cfg.model, "cola_module", None), "distill_cola_params_only", False
-        ),
+        getattr(cfg, "exclude_aux_params", False),
         getattr(getattr(cfg.model, "cola_module", None), "calibration", False),
+        getattr(getattr(cfg.model, "cola_module", None), "distill_from_svd", False),
     )
 
     if fsdp_config is None:
@@ -588,7 +606,7 @@ def main(cfg):
 
     if int(state.timestamp.epoch) > 0:
         spin_dataloaders_to_cur_epoch(state)
-    
+
     if state.timestamp.batch_in_epoch == 0 and rng_state is not None:
         # only restore the rng state here if the step in the current epoch is zero.
         reproducibility.load_rng_state(rng_state)
@@ -619,7 +637,8 @@ def main(cfg):
             if batch_idx < int(state.timestamp.batch_in_epoch) + int(state.start_from):
                 # Restore the RNG state immediately before the next batch is yielded from the dataloader
                 if (
-                    batch_idx + 1 == int(state.timestamp.batch_in_epoch) + int(state.start_from)
+                    batch_idx + 1
+                    == int(state.timestamp.batch_in_epoch) + int(state.start_from)
                     and rng_state is not None
                 ):
                     reproducibility.load_rng_state(rng_state)

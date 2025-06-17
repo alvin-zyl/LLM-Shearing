@@ -4,6 +4,7 @@ tokenizer_name: meta-llama/Llama-2-7b-hf
 max_seq_len: 4096
 global_seed: 17
 cola_params_only: true
+exclude_aux_params: true
 
 # Run Name
 run_name: # If left blank, will be read from env var $COMPOSER_RUN_NAME
@@ -26,12 +27,19 @@ model:
   attn_impl: flash
   rms_norm_eps: 1e-5
   cola_module:
+    path: /global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm/svdllm_1638_2388.pt
+    model_type: cola
+    attn_rank: 1638
+    mlp_rank: 2388
     latent_act_type: silu
     latent_act_schedule: constant
     latent_act_ratio: 1.0
     latent_act_warmup_steps: 640ba
+    keep_full_rank_act: true
     distillation: true
     distill_cola_params_only: true
+    distill_from_svd: true
+    eval_student: true
     calibration: false
 
 # Tokenizer

@@ -14,8 +14,9 @@ def main(cfg):
     else:
         model = ComposerMosaicLlama(cfg.model)
     print("Model built")
-
-    if isinstance(model, ComposerMosaicCoLA) and cfg.consolidate_cola_params_only:
+    
+    consolidate_cola_params_only = getattr(cfg, "consolidate_cola_params_only", False)
+    if isinstance(model, ComposerMosaicCoLA) and consolidate_cola_params_only:
         print("Consolidating cola params only")
         state_dict = {
             "state": {"model": {k: v for k, v in model.state_dict().items() if "cola" in k}}
@@ -33,7 +34,7 @@ def main(cfg):
 
     save_path = (
         f"{cfg.load_path}.pt"
-        if not cfg.consolidate_cola_params_only
+        if not consolidate_cola_params_only
         else f"{cfg.load_path}_cola_params.pt"
     )
     print(f"Saving as full to {save_path}")

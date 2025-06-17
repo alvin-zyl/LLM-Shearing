@@ -36,7 +36,7 @@ class CoLAUpProjLayer(nn.Module):
 
     def forward(self, x):
         return torch.matmul(x, self.weight)
-    
+
     def __repr__(self):
         return f"CoLAUpProjLayer(d_features={self.d_features}, rank={self.rank})"
 
@@ -58,7 +58,6 @@ class CoLADownProjLayer(nn.Module):
 
     def __repr__(self):
         return f"CoLADownProjLayer(d_features={self.d_features}, rank={self.rank})"
-
 
 
 class LlamaRMSNorm(nn.Module):
@@ -246,6 +245,9 @@ class ComposerMosaicCoLA(ComposerModel):
     ) -> nn.Embedding:
         if new_num_tokens is not None:
             self.model._resize_token_embeddings(new_num_tokens)
+
+    def merge_distill_params(self):
+        self.model.merge_distill_params()
 
 
 class CoLAModel(nn.Module):
@@ -483,6 +485,10 @@ class CoLAModel(nn.Module):
     def activation_checkpointing_fn(self, module):
         return isinstance(module, CoLABlock)
 
+    def merge_distill_params(self):
+        for block in self.transformer.blocks:
+            block.merge_distill_params()
+
 
 class CoLABlock(nn.Module):
     def __init__(self, cfg: DictConfig, device: Optional[str] = None):
@@ -565,6 +571,10 @@ class CoLABlock(nn.Module):
 
         return x, past_key_value, distill_loss
 
+    def merge_distill_params(self):
+        self.attn.merge_distill_params()
+        self.mlp.merge_distill_params()
+
 
 def turn_head_z(head_z, head_layer_z):
     head_z = head_z.squeeze().clone()
@@ -613,6 +623,8 @@ class CoLAAttention(nn.Module):
         self.distill_cola_params_only = getattr(
             cola_module_cfg, "distill_cola_params_only", False
         )
+        self.distill_from_svd = getattr(cola_module_cfg, "distill_from_svd", False)
+        self.eval_student = getattr(cola_module_cfg, "eval_student", True)
 
         self.model_type = getattr(cola_module_cfg, "model_type", "hybrid")
         self.rank = getattr(cola_module_cfg, "attn_rank", self.d_model)
@@ -620,7 +632,9 @@ class CoLAAttention(nn.Module):
             cola_module_cfg, "delay_init_cola_params", False
         )
 
-        if self.model_type == "hybrid" or self.distillation:
+        if (
+            self.model_type == "hybrid" or self.distillation
+        ) and not self.distill_from_svd:
             self.wq = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
             self.wk = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
             self.wv = nn.Linear(self.d_model, self.d_model, device=device, bias=False)
@@ -628,6 +642,14 @@ class CoLAAttention(nn.Module):
                 self.d_model, self.d_model, device=device, bias=False
             )
             self.out_proj._is_residual = True  # type: ignore
+
+        if self.distill_from_svd:
+            self.wq_distill_params = nn.Parameter(torch.diag(torch.ones(self.rank)))
+            self.wk_distill_params = nn.Parameter(torch.diag(torch.ones(self.rank)))
+            self.wv_distill_params = nn.Parameter(torch.diag(torch.ones(self.rank)))
+            self.out_proj_distill_params = nn.Parameter(
+                torch.diag(torch.ones(self.rank))
+            )
 
         if self.model_type == "cola" and not self.delay_init_cola_params:
             self.cola_a_initialized = True
@@ -795,13 +817,7 @@ class CoLAAttention(nn.Module):
         retain_grad=False,
         attn_hidden_z=None,
     ):
-
-        # qkv = self.Wqkv(x)
-        # query, key, value = qkv.chunk(3, dim=2)
-        # if self.wq is None:
-        #     return None, None, past_key_value
-
-        if self.cola_a_initialized and not self.distillation:
+        if self.cola_a_initialized and (not self.distillation or self.distill_from_svd):
             query_t = self.wq_cola_a(x)
             key_t = self.wk_cola_a(x)
             value_t = self.wv_cola_a(x)
@@ -854,12 +870,17 @@ class CoLAAttention(nn.Module):
                 + (1 - latent_act_ratio) * value_s
             )
 
+        if self.distill_from_svd:
+            query_s = torch.matmul(query_s, self.wq_distill_params)
+            key_s = torch.matmul(key_s, self.wk_distill_params)
+            value_s = torch.matmul(value_s, self.wv_distill_params)
+
         if attn_hidden_z is not None:
             query_s *= attn_hidden_z[0]
             key_s *= attn_hidden_z[1]
             value_s *= attn_hidden_z[2]
 
-        if self.cola_b_initialized:
+        if self.cola_b_initialized and not self.distill_from_svd:
             query_s = self.wq_cola_b(query_s)
             key_s = self.wk_cola_b(key_s)
             value_s = self.wv_cola_b(value_s)
@@ -873,7 +894,11 @@ class CoLAAttention(nn.Module):
         else:
             distill_loss = None
 
-        if self.distillation and self.distill_cola_params_only and self.training:
+        if (
+            self.distillation
+            and self.distill_cola_params_only
+            and (self.training if self.eval_student else True)
+        ):
             query = query_t
             key = key_t
             value = value_t
@@ -881,6 +906,11 @@ class CoLAAttention(nn.Module):
             query = query_s
             key = key_s
             value = value_s
+
+        if self.distill_from_svd and self.cola_b_initialized:
+            query = self.wq_cola_b(query)
+            key = self.wk_cola_b(key)
+            value = self.wv_cola_b(value)
 
         query_padding_mask = None
         if key_padding_mask is not None:
@@ -941,7 +971,7 @@ class CoLAAttention(nn.Module):
             if self.context.requires_grad:
                 self.context.retain_grad()
 
-        if self.cola_a_initialized and not self.distillation:
+        if self.cola_a_initialized and (not self.distillation or self.distill_from_svd):
             output_t = self.out_proj_cola_a(context)
             output_s = output_t
         else:
@@ -960,19 +990,33 @@ class CoLAAttention(nn.Module):
                 + (1 - latent_act_ratio) * output_s
             )
 
+        if self.distill_from_svd:
+            output_s = torch.matmul(output_s, self.out_proj_distill_params)
+
         if attn_hidden_z is not None:
             output_s *= attn_hidden_z[3]
 
-        if self.cola_b_initialized:
+        if self.cola_b_initialized and not self.distill_from_svd:
             output_s = self.out_proj_cola_b(output_s)
+
+        # if self.distill_from_svd and self.cola_b_initialized:
+        #     output_s = self.out_proj_cola_b(output_s)
+        #     output_t = self.out_proj_cola_b(output_t)
 
         if self.distillation:
             distill_loss += F.mse_loss(output_s, output_t)
 
-        if self.distillation and self.distill_cola_params_only and self.training:
+        if (
+            self.distillation
+            and self.distill_cola_params_only
+            and (self.training if self.eval_student else True)
+        ):
             output = output_t
         else:
             output = output_s
+
+        if self.distill_from_svd and self.cola_b_initialized:
+            output = self.out_proj_cola_b(output)
 
         if retain_grad:
             self.output = output
@@ -980,6 +1024,26 @@ class CoLAAttention(nn.Module):
                 self.output.retain_grad()
 
         return output, attn_weights, past_key_value, distill_loss
+
+    @torch.no_grad()
+    def merge_distill_params(self):
+        self.wq_cola_b.weight.data = torch.matmul(
+            self.wq_distill_params.data, self.wq_cola_b.weight.data
+        )
+        self.wk_cola_b.weight.data = torch.matmul(
+            self.wk_distill_params.data, self.wk_cola_b.weight.data
+        )
+        self.wv_cola_b.weight.data = torch.matmul(
+            self.wv_distill_params.data, self.wv_cola_b.weight.data
+        )
+        self.out_proj_cola_b.weight.data = torch.matmul(
+            self.out_proj_distill_params.data, self.out_proj_cola_b.weight.data
+        )
+
+        del self.wq_distill_params
+        del self.wk_distill_params
+        del self.wv_distill_params
+        del self.out_proj_distill_params
 
 
 class CoLAMLP(nn.Module):
@@ -1001,14 +1065,16 @@ class CoLAMLP(nn.Module):
         self.distill_cola_params_only = getattr(
             cola_module_cfg, "distill_cola_params_only", False
         )
-        self.keep_full_rank_act = getattr(
-            cola_module_cfg, "keep_full_rank_act", False
-        )
+        self.distill_from_svd = getattr(cola_module_cfg, "distill_from_svd", False)
+        self.eval_student = getattr(cola_module_cfg, "eval_student", True)
+        self.keep_full_rank_act = getattr(cola_module_cfg, "keep_full_rank_act", False)
 
         self.model_type = getattr(cola_module_cfg, "model_type", "hybrid")
         self.rank = getattr(cola_module_cfg, "mlp_rank", None)
 
-        if self.model_type == "hybrid" or self.distillation:
+        if (
+            self.model_type == "hybrid" or self.distillation
+        ) and not self.distill_from_svd:
             self.gate_proj = nn.Linear(
                 cfg.d_model, cfg.intermediate_size, bias=False, device=device
             )
@@ -1019,6 +1085,17 @@ class CoLAMLP(nn.Module):
                 cfg.d_model, cfg.intermediate_size, bias=False, device=device
             )
             self.down_proj._is_residual = True  # type: ignore
+
+        if self.distill_from_svd:
+            self.gate_proj_distill_params = nn.Parameter(
+                torch.diag(torch.ones(self.rank))
+            )
+            self.down_proj_distill_params = nn.Parameter(
+                torch.diag(torch.ones(self.rank))
+            )
+            self.up_proj_distill_params = nn.Parameter(
+                torch.diag(torch.ones(self.rank))
+            )
 
         if self.model_type == "cola" and not self.delay_init_cola_params:
             self.cola_a_initialized = True
@@ -1103,8 +1180,8 @@ class CoLAMLP(nn.Module):
         intermediate_z=None,
         mlp_hidden_z=None,
     ):
-        if self.cola_a_initialized and not self.distillation:
-            gate_t = gate_s = self.gate_proj_cola_a(x)
+        if self.cola_a_initialized and (not self.distillation or self.distill_from_svd):
+            gate_t = gate_t_pre_act = gate_s = self.gate_proj_cola_a(x)
             up_v_t = up_v_s = self.up_proj_cola_a(x)
 
         else:
@@ -1130,37 +1207,63 @@ class CoLAMLP(nn.Module):
                     + (1 - latent_act_ratio) * gate_s
                 )
 
+        if self.distill_from_svd:
+            gate_s = torch.matmul(gate_s, self.gate_proj_distill_params)
+            up_v_s = torch.matmul(up_v_s, self.up_proj_distill_params)
+
         if intermediate_z is not None:
             gate_s *= intermediate_z[0]
             up_v_s *= intermediate_z[1]
 
-        if self.cola_b_initialized:
+        if self.cola_b_initialized and not self.distill_from_svd:
             gate_s = self.gate_proj_cola_b(gate_s)
             up_v_s = self.up_proj_cola_b(up_v_s)
+
+        # if self.distill_from_svd and self.cola_b_initialized:
+        #     gate_s = self.gate_proj_cola_b(gate_s)
+        #     up_v_s = self.up_proj_cola_b(up_v_s)
+
+        #     gate_t_pre_act = self.gate_proj_cola_b(gate_t)
+        #     gate_t = F.silu(gate_t_pre_act)
+        #     up_v_t = self.up_proj_cola_b(up_v_t)
 
         if self.distillation:
             distill_loss = F.mse_loss(up_v_s, up_v_t)
             if self.cola_a_initialized:
-                distill_loss += F.mse_loss(gate_s, gate_t if not self.keep_full_rank_act else gate_t_pre_act)
+                distill_loss += F.mse_loss(
+                    gate_s, gate_t if not self.keep_full_rank_act else gate_t_pre_act
+                )
         else:
             distill_loss = None
 
-        if self.cola_a_initialized and self.keep_full_rank_act:
+        if (
+            self.cola_a_initialized
+            and self.keep_full_rank_act
+            and not self.distill_from_svd
+        ):
             gate_s = F.silu(gate_s)
 
-        if self.distillation and self.distill_cola_params_only and self.training:
+        if (
+            self.distillation
+            and self.distill_cola_params_only
+            and (self.training if self.eval_student else True)
+        ):
             gate = gate_t
             up_v = up_v_t
         else:
             gate = gate_s
             up_v = up_v_s
 
+        if self.distill_from_svd and self.cola_b_initialized:
+            gate = F.silu(self.gate_proj_cola_b(gate))
+            up_v = self.up_proj_cola_b(up_v)
+
         if retain_grad:
             self.up_v = up_v
             if self.up_v.requires_grad:
                 self.up_v.retain_grad()
 
-        if self.cola_a_initialized and not self.distillation:
+        if self.cola_a_initialized and (not self.distillation or self.distill_from_svd):
             down_v_t = self.down_proj_cola_a(gate * up_v)
             down_v_s = down_v_t
         else:
@@ -1178,10 +1281,13 @@ class CoLAMLP(nn.Module):
                 + (1 - latent_act_ratio) * down_v_s
             )
 
+        if self.distill_from_svd:
+            down_v_s = torch.matmul(down_v_s, self.down_proj_distill_params)
+
         if mlp_hidden_z is not None:
             down_v_s *= mlp_hidden_z
 
-        if self.cola_b_initialized:
+        if self.cola_b_initialized and not self.distill_from_svd:
             down_v_s = self.down_proj_cola_b(down_v_s)
 
         if self.calibration:
@@ -1204,10 +1310,17 @@ class CoLAMLP(nn.Module):
         if self.distillation:
             distill_loss += F.mse_loss(down_v_s, down_v_t)
 
-        if self.distillation and self.distill_cola_params_only and self.training:
+        if (
+            self.distillation
+            and self.distill_cola_params_only
+            and (self.training if self.eval_student else True)
+        ):
             down_v = down_v_t
         else:
             down_v = down_v_s
+
+        if self.distill_from_svd and self.cola_b_initialized:
+            down_v = self.down_proj_cola_b(down_v)
 
         if retain_grad:
             self.output = down_v
@@ -1215,6 +1328,22 @@ class CoLAMLP(nn.Module):
                 self.output.retain_grad()
 
         return down_v, distill_loss
+
+    @torch.no_grad()
+    def merge_distill_params(self):
+        self.gate_proj_cola_b.weight.data = torch.matmul(
+            self.gate_proj_distill_params.data, self.gate_proj_cola_b.weight.data
+        )
+        self.up_proj_cola_b.weight.data = torch.matmul(
+            self.up_proj_distill_params.data, self.up_proj_cola_b.weight.data
+        )
+        self.down_proj_cola_b.weight.data = torch.matmul(
+            self.down_proj_distill_params.data, self.down_proj_cola_b.weight.data
+        )
+
+        del self.gate_proj_distill_params
+        del self.up_proj_distill_params
+        del self.down_proj_distill_params
 
 
 def check_valid_inputs(*tensors, valid_dtypes=[torch.float16, torch.bfloat16]):
