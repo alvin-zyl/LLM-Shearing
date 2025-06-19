@@ -19,13 +19,20 @@ LAUNCH_SCRIPT=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/scr
 DATA_DIR=/pscratch/sd/a/alvinliu/datasets/shearllm/for_prune
 OUTPUT_DIR=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
 TRAIN_SCRIPT=${PROJ_DIR}/llmshearing/train.py
-MODEL_PATH=${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer
+path=${MODEL_PATH:-"${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer/state_dict.pt"}
+SEED=${SEED-"17"}
+
+if [ "${MODEL_PATH}" != "none" ]; then
+    readonly teacher_model_flag="model.path=${path}"
+else
+    readonly teacher_model_flag=""
+fi
+
 
 # Specify $PROJ_DIR in scripts/launch.sh and scripts/srun_launch.sh if using slurm
 
 from_model=7b # source model size
 config_file=${PROJ_DIR}/llmshearing/configs/cola-llama2/${from_model}-distill-hpc.yaml
-path=$MODEL_PATH/state_dict.pt
 
 # data setup
 data_local=${DATA_DIR}
@@ -41,13 +48,14 @@ device_eval_batch_size=8
 # learning setup
 LR=${LR:-"1e-3"}
 STEPS=${STEPS:-"3200ba"}
-SAVE_STEPS=${SAVE_STEPS:-"100ba"}
+SAVE_STEPS=${SAVE_STEPS:-"800ba"}
 WU=${WU:-"320ba"}
 lr=$LR # learning rate for the main parameters
 max_duration=$STEPS # 0.42B tokens
 save_interval=$SAVE_STEPS # save in the end
 t_warmup=$WU # 10% learning rate warmup 
 
+LA_RATIO=${LA_RATIO:-"1.0"}
 LA_SCHED=${LA_SCHED:-"constant"}
 LA_WU=${LA_WU:-"320ba"}
 
@@ -98,6 +106,7 @@ export HF_HOME="/pscratch/sd/a/alvinliu/datasets/.cache/huggingface"
 srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=$SLURM_JOB_NUM_NODES \
     --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT $PROJ_DIR/llmshearing/train_torch.py \
     $config_file \
+    global_seed=${SEED} \
     run_name=${run_name} \
     data_local=${data_local} \
     eval_loader.dataset.split=${eval_split_name} \
@@ -113,7 +122,8 @@ srun -u shifter torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=
     eval_interval=${eval_interval} \
     save_interval=${save_interval} \
     optimizer.lr=${lr} \
-    model.path=${path} \
+    $teacher_model_flag \
+    model.cola_module.latent_act_ratio=${LA_RATIO} \
     model.cola_module.latent_act_schedule=${LA_SCHED} \
     model.cola_module.latent_act_warmup_steps=${LA_WU} \
     callbacks.data_loading.dynamic=${dynamic} \

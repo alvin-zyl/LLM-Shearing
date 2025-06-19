@@ -159,13 +159,13 @@ def build_optimizer(
         if getattr(optimizer_config, "cola_b_only", False):
             console_print("Only optimizing cola_b params")
             optimizer_config.pop("cola_b_only")
-            cola_model_params = cola_model_params = [
+            cola_model_params = [
                 p for n, p in model.named_parameters() if "cola_b" in n
             ]
         elif getattr(optimizer_config, "cola_a_only", False):
             console_print("Only optimizing cola_a params")
             optimizer_config.pop("cola_a_only")
-            cola_model_params = cola_model_params = [
+            cola_model_params = [
                 p for n, p in model.named_parameters() if "cola_a" in n
             ]
         aux_model_params = (
@@ -606,6 +606,7 @@ def main(cfg):
             state=state,
             logger=loggers,
             path=parsed_load_path,
+            load_weights_only=getattr(cfg, "load_weights_only", False)
         )
         state.run_name = cfg.run_name
         loggers.log_traces({"Finished": f"Loading from {load_path}"})
