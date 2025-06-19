@@ -63,7 +63,6 @@ from llmfoundry.utils.builders import (
     build_algorithm,
     build_callback,
     build_logger,
-    build_scheduler,
 )
 from llmfoundry.utils.config_utils import log_config, pop_config, update_batch_size_info
 from omegaconf import DictConfig
@@ -186,16 +185,33 @@ def build_optimizer(
             p for n, p in model.named_parameters() if "l0_module" in n and "lambda" in n
         ]
 
-        param_groups = [
-            {
-                "params": (
-                    main_model_params
-                    if (not cola_model_params or not cola_params_only)
-                    else cola_model_params + aux_model_params
-                ),
-                "lr": optimizer_config.lr,
-            }
-        ]
+        if getattr(optimizer_config, "separate_cola_params", False):
+            optimizer_config.pop("separate_cola_params")
+            console_print("Separating CoLA A and B params into two groups")
+            cola_b_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+            cola_a_params = [p for n, p in model.named_parameters() if "cola_a" in n]
+            param_groups = [
+                {
+                    "params": (cola_b_params + aux_model_params),
+                    "lr": optimizer_config.lr,
+                },
+                {
+                    "params": cola_a_params,
+                    "lr": optimizer_config.lr,
+                },
+            ]
+        else:
+            param_groups = [
+                {
+                    "params": (
+                        main_model_params
+                        if (not cola_model_params or not cola_params_only)
+                        else cola_model_params + aux_model_params
+                    ),
+                    "lr": optimizer_config.lr,
+                }
+            ]
+
         if len(l0_module_params) > 0:
             lag_lr = pop_config(optimizer_config, "lag_lr")
             param_groups.extend(
@@ -387,7 +403,11 @@ def main(cfg):
         optimizers = map_collection(optimizers, device.optimizer_to_device)
 
     # Scheduler
-    schedulers = build_scheduler(cfg.scheduler.pop("name"), cfg.scheduler)
+    schedulers = []
+    if getattr(cfg, "scheduler", None):
+        scheduler_cfgs = cfg.scheduler
+        for scheduler_cfg in scheduler_cfgs.values():
+            schedulers.append(build_scheduler(scheduler_cfg.pop("name"), scheduler_cfg))
 
     # Callbacks
     callbacks = []

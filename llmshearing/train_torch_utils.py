@@ -43,7 +43,6 @@ from composer.core import (
 from dist_strategy import prepare_ddp_module, prepare_fsdp_module
 from composer.trainer._scaler import ClosureGradScaler
 from torch.cuda.amp.grad_scaler import GradScaler
-from composer.optim import ComposerScheduler, compile_composer_scheduler
 from composer.trainer._scale_schedule import scale_pytorch_scheduler
 from composer.core.data_spec import ensure_data_spec
 from composer.loggers import Logger
@@ -52,6 +51,15 @@ from composer.trainer.dist_strategy import DDPSyncStrategy, ddp_sync_context
 from state import State
 from torchmetrics import Metric
 from composer.utils.misc import is_model_deepspeed, model_eval_mode
+from scheduler import (
+    compile_composer_scheduler,
+    ComposerScheduler,
+    ConstantWithWarmupScheduler,
+    CosineAnnealingWithWarmupScheduler,
+    LinearWithWarmupScheduler,
+    ConstantWithWarmupCooldownScheduler,
+    DelayedConstantWithWarmupCooldownScheduler
+)
 
 Scheduler = Union[ComposerScheduler, PyTorchScheduler]
 
@@ -309,21 +317,27 @@ def cast(typ, val):
     return val
 
 
+def build_scheduler(name: str, scheduler_config: Dict[str, Any]) -> ComposerScheduler:
+    if name == "constant_with_warmup":
+        return ConstantWithWarmupScheduler(**scheduler_config)
+    elif name == "cosine_with_warmup":
+        return CosineAnnealingWithWarmupScheduler(**scheduler_config)
+    elif name == "linear_decay_with_warmup":
+        return LinearWithWarmupScheduler(**scheduler_config)
+    elif name == "constant_with_warmup_cooldown":
+        return ConstantWithWarmupCooldownScheduler(**scheduler_config)
+    elif name == "delayed_constant_with_warmup_cooldown":
+        return DelayedConstantWithWarmupCooldownScheduler(**scheduler_config)
+    else:
+        raise ValueError(f"Not sure how to build scheduler: {name}")
+
+
 def compile_schedulers(
     schedulers: Optional[Union[Scheduler, Sequence[Scheduler]]],
     state: State,
     scale_schedule_ratio: float,
 ) -> List[PyTorchScheduler]:
-    compiled_schedulers = []
-    for scheduler in ensure_tuple(schedulers):
-        if isinstance(scheduler, PyTorchScheduler):
-            scale_pytorch_scheduler(scheduler, scale_schedule_ratio)
-            compiled_schedulers.append(scheduler)
-        else:  # it's a composer scheduler
-            compiled_schedulers.append(
-                compile_composer_scheduler(scheduler, state, scale_schedule_ratio)
-            )
-
+    compiled_schedulers = compile_composer_scheduler(schedulers, state, scale_schedule_ratio)
     return compiled_schedulers
 
 
@@ -386,7 +400,7 @@ def iter_dataloader(state: State, engine: "CallbackEngine", logger: Logger):
             batch = next(dataloader_iter)
         except StopIteration:
             break
-        
+
         yield batch
 
 
