@@ -17,7 +17,7 @@ done
 PROJ_DIR=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing
 LAUNCH_SCRIPT=/global/cfs/cdirs/m4645/alvinliu/repo/LLM-Shearing/llmshearing/scripts/launch.sh
 DATA_DIR=/pscratch/sd/a/alvinliu/datasets/shearllm/for_prune
-OUTPUT_DIR=/global/cfs/cdirs/m4645/alvinliu/workspace/results/shearllm
+OUTPUT_DIR=/global/cfs/cdirs/m4788/alvinliu/workspace_4788/results_4788/shearllm
 TRAIN_SCRIPT=${PROJ_DIR}/llmshearing/train.py
 MODEL_PATH=${PROJ_DIR}/llmshearing/models/Llama-2-7b-composer
 
@@ -40,9 +40,9 @@ device_eval_batch_size=8
 
 # learning setup
 lr=1e-3 # learning rate for the main parameters
-max_duration=3200ba # 0.42B tokens
-save_interval=100ba # save in the end
-t_warmup=320ba # 10% learning rate warmup 
+max_duration=1600ba # 0.42B tokens
+save_interval=1600ba # save in the end
+t_warmup=160ba # 10% learning rate warmup 
 
 # dynamic loading setup
 dynamic=True

@@ -806,8 +806,8 @@ class CoLAAttention(nn.Module):
 
         if self.cola_initialized:
             query_s = self.wq_cola_b(query_s)
-            key_s = self.wq_cola_b(key_s)
-            value_s = self.wq_cola_b(value_s)
+            key_s = self.wk_cola_b(key_s)
+            value_s = self.wv_cola_b(value_s)
 
         if self.distillation:
             distill_loss = (
