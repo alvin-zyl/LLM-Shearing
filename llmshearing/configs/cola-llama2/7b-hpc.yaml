@@ -3,7 +3,7 @@ data_remote: # If blank, files must be present in data_local
 tokenizer_name: meta-llama/Llama-2-7b-hf
 max_seq_len: 4096
 global_seed: 17
-cola_params_only: true
+cola_params_only: false
 
 # Run Name
 run_name: # If left blank, will be read from env var $COMPOSER_RUN_NAME
@@ -37,7 +37,7 @@ model:
   cola_module:
     latent_act_type: silu
     latent_act_warmup_steps: 640ba
-    distillation: true
+    distillation: false
 
 # Tokenizer
 tokenizer:

@@ -114,6 +114,19 @@ def load_weights(cfg: DictConfig):
     return None
 
 
+def load_cola_weights(cfg: DictConfig):
+    """load weights"""
+    if cfg.model.cola_module.get("path", None):
+        state_dict = torch.load(
+            cfg.model.cola_module.path, mmap=True
+        )  # for loading pre-trained llama
+        if "state" in state_dict:
+            state_dict = state_dict["state"]["model"]
+        console_print(f"Loaded model from path: {cfg.model.cola_module.path}")
+        return state_dict
+    return None
+
+
 def load_state_dict(model: nn.Module, state_dict: Dict[str, Any]):
     """load state dict to the model"""
     result = model.load_state_dict(state_dict, strict=False)
@@ -128,6 +141,7 @@ def build_optimizer(
     cola_params_only: bool = False,
     exclude_aux_params: bool = False,
     calibration: bool = False,
+    distill_from_svd: bool = False,
 ) -> Optimizer:
     """
     build optimizer that consists of three groups of parameters:
@@ -138,7 +152,23 @@ def build_optimizer(
     param_groups = {}
 
     if not calibration:
-        cola_model_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+        cola_model_params = [
+            p
+            for n, p in model.named_parameters()
+            if ("cola" if not distill_from_svd else "distill") in n
+        ]
+        if getattr(optimizer_config, "cola_b_only", False):
+            console_print("Only optimizing cola_b params")
+            optimizer_config.pop("cola_b_only")
+            cola_model_params = [
+                p for n, p in model.named_parameters() if "cola_b" in n
+            ]
+        elif getattr(optimizer_config, "cola_a_only", False):
+            console_print("Only optimizing cola_a params")
+            optimizer_config.pop("cola_a_only")
+            cola_model_params = [
+                p for n, p in model.named_parameters() if "cola_a" in n
+            ]
         aux_model_params = (
             [p for n, p in model.named_parameters() if "ln" in n or "wte" in n]
             if not exclude_aux_params
@@ -156,16 +186,33 @@ def build_optimizer(
             p for n, p in model.named_parameters() if "l0_module" in n and "lambda" in n
         ]
 
-        param_groups = [
-            {
-                "params": (
-                    main_model_params
-                    if (not cola_model_params or not cola_params_only)
-                    else cola_model_params + aux_model_params
-                ),
-                "lr": optimizer_config.lr,
-            }
-        ]
+        if getattr(optimizer_config, "separate_cola_params", False):
+            optimizer_config.pop("separate_cola_params")
+            console_print("Separating CoLA A and B params into two groups")
+            cola_b_params = [p for n, p in model.named_parameters() if "cola_b" in n]
+            cola_a_params = [p for n, p in model.named_parameters() if "cola_a" in n]
+            param_groups = [
+                {
+                    "params": (cola_b_params + aux_model_params),
+                    "lr": optimizer_config.lr,
+                },
+                {
+                    "params": cola_a_params,
+                    "lr": optimizer_config.lr,
+                },
+            ]
+        else:
+            param_groups = [
+                {
+                    "params": (
+                        main_model_params
+                        if (not cola_model_params or not cola_params_only)
+                        else cola_model_params + aux_model_params
+                    ),
+                    "lr": optimizer_config.lr,
+                }
+            ]
+
         if len(l0_module_params) > 0:
             lag_lr = pop_config(optimizer_config, "lag_lr")
             param_groups.extend(
@@ -278,13 +325,28 @@ def main(cfg):
         console_print(cfg.model.l0_module)
     console_print("Initialized model")
 
-    console_print("Loading state dicts")
-    state_dict = load_weights(cfg)
-    console_print("Loaded state dicts")
-    if state_dict is not None:
-        console_print("Loading weights")
-        load_state_dict(model, state_dict)
-        console_print("Loaded weights")
+    if "path" in cfg.model:
+        console_print("Loading state dicts")
+        state_dict = load_weights(cfg)
+        console_print("Loaded state dicts")
+        if state_dict is not None:
+            console_print("Loading weights")
+            load_state_dict(model, state_dict)
+            console_print("Loaded weights")
+        del state_dict
+
+    if (
+        "cola" in cfg.model.name
+        and getattr(getattr(cfg.model, "cola_module", None), "path", None) is not None
+    ):
+        console_print("Loading cola state dicts")
+        cola_state_dict = load_cola_weights(cfg)
+        console_print("Loaded cola state dicts")
+        if cola_state_dict is not None:
+            console_print("Loading cola weights")
+            load_state_dict(model, cola_state_dict)
+            console_print("Loaded cola weights")
+        del cola_state_dict
 
     cfg.n_params = sum(p.numel() for p in model.parameters())
     console_print(f"{cfg.n_params=:.2e}")
@@ -295,6 +357,10 @@ def main(cfg):
     assert (
         getattr(cfg.callbacks.data_loading, "set_names", None) is not None
     ), "please specify the set (domain) names in the config"
+
+    import streaming
+
+    streaming.base.util.clean_stale_shared_memory()
 
     console_print("Building train loader...")
     train_loader = build_text_dataloader(
@@ -328,10 +394,9 @@ def main(cfg):
         cfg.optimizer.pop("name"),
         cfg.optimizer,
         getattr(cfg, "cola_params_only", False),
-        getattr(
-            getattr(cfg.model, "cola_module", None), "distill_cola_params_only", False
-        ),
+        getattr(cfg, "exclude_aux_params", False),
         getattr(getattr(cfg.model, "cola_module", None), "calibration", False),
+        getattr(getattr(cfg.model, "cola_module", None), "distill_from_svd", False),
     )
 
     if fsdp_config is None:
@@ -492,6 +557,7 @@ def main(cfg):
             state.train_dataloader,
         )
 
+    state.start_from = ensure_time(getattr(cfg, "start_from", 0), TimeUnit.BATCH)
     state.max_duration = ensure_time(cfg.max_duration, TimeUnit.EPOCH)
     state.schedulers = compile_schedulers(schedulers, state, 1.0)
     scheduler_step_frequency = TimeUnit.BATCH
@@ -537,6 +603,7 @@ def main(cfg):
             state=state,
             logger=loggers,
             path=parsed_load_path,
+            load_weights_only=getattr(cfg, "load_weights_only", False)
         )
         state.run_name = cfg.run_name
         loggers.log_traces({"Finished": f"Loading from {load_path}"})
@@ -555,7 +622,9 @@ def main(cfg):
     engine.fit_start(state, loggers)
     use_grad_scaling = use_grad_scaling_(state, state.precision, state.scaler)
 
-    spin_dataloaders_to_cur_epoch(state)
+    if int(state.timestamp.epoch) > 0:
+        spin_dataloaders_to_cur_epoch(state)
+
     if state.timestamp.batch_in_epoch == 0 and rng_state is not None:
         # only restore the rng state here if the step in the current epoch is zero.
         reproducibility.load_rng_state(rng_state)
@@ -570,13 +639,12 @@ def main(cfg):
             engine.epoch_start(state, loggers)
             loggers.log_metrics({"time/epoch": state.timestamp.epoch.value})
 
-        dataloader = state.dataloader
-        if isinstance(dataloader, DataLoader) and isinstance(
-            dataloader.sampler, DistributedSampler
-        ):
-            dataloader.sampler.set_epoch(int(state.timestamp.epoch))
-
-        loggers.log_metrics({"time/epoch": state.timestamp.epoch.value})
+        if int(state.timestamp.epoch) > 0:
+            dataloader = state.dataloader
+            if isinstance(dataloader, DataLoader) and isinstance(
+                dataloader.sampler, DistributedSampler
+            ):
+                dataloader.sampler.set_epoch(int(state.timestamp.epoch))
 
         print(
             f"Process {os.getpid()} starting loading data in epoch {int(state.timestamp.epoch)}"
@@ -584,10 +652,11 @@ def main(cfg):
         for batch_idx, state.batch in enumerate(
             iter_dataloader(state, engine, loggers)
         ):
-            if batch_idx < int(state.timestamp.batch_in_epoch):
+            if batch_idx < int(state.timestamp.batch_in_epoch) + int(state.start_from):
                 # Restore the RNG state immediately before the next batch is yielded from the dataloader
                 if (
-                    batch_idx + 1 == int(state.timestamp.batch_in_epoch)
+                    batch_idx + 1
+                    == int(state.timestamp.batch_in_epoch) + int(state.start_from)
                     and rng_state is not None
                 ):
                     reproducibility.load_rng_state(rng_state)
